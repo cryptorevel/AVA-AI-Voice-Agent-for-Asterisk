@@ -741,3 +741,53 @@ def test_builtin_patch_accepts_valid_email_and_persists(email_client):
     assert len(email_client.state["writes"]) == 1  # valid data persisted once
     persisted = yaml.safe_load(email_client.state["writes"][0])
     assert persisted["tools"]["send_email_summary"]["admin_email"] == "ops@example.com"
+
+
+def test_sarah_technician_admin_crud_exceptions_and_preview(monkeypatch, tmp_path):
+    from src.operations.service import OperationalService
+
+    service = OperationalService(str(tmp_path / "operations.db"))
+    config = {
+        "timezone": "America/Vancouver",
+        "service_catalog": {"repair": {"enabled": True, "duration_minutes": 120}},
+        "scheduling": {
+            "enabled": True,
+            "minimum_notice_minutes": 0,
+            "slot_interval_minutes": 120,
+            "max_offered_slots": 3,
+            "business_hours": {"mon": ["09:00", "17:00"]},
+        },
+    }
+    monkeypatch.setattr(tools_api, "_operational_capacity_service",
+                        lambda: (config, "org-admin", service))
+    app = FastAPI()
+    app.include_router(tools_api.router, prefix="/api/tools")
+    client = TestClient(app)
+
+    payload = {
+        "id": "tech-1", "display_name": "", "active": True,
+        "timezone": "America/Vancouver", "service_ids": ["repair"],
+        "working_hours": {"mon": [["09:00", "17:00"]]},
+    }
+    created = client.post("/api/tools/technicians", json=payload)
+    assert created.status_code == 201, created.text
+    assert created.json()["display_name"] == "tech-1"
+    assert client.post("/api/tools/technicians", json=payload).status_code == 409
+    assert client.get("/api/tools/technicians").json()["technicians"][0]["id"] == "tech-1"
+
+    time_off = client.post("/api/tools/technicians/tech-1/time-off", json={
+        "start_datetime": "2026-09-07T09:00:00-07:00",
+        "end_datetime": "2026-09-07T11:00:00-07:00", "reason": "training"})
+    assert time_off.status_code == 201, time_off.text
+    preview = client.get("/api/tools/technicians/tech-1/availability-preview", params={
+        "service_code": "repair", "start_date": "2026-09-07", "days": 1})
+    assert preview.status_code == 200, preview.text
+    assert preview.json()["status"] == "available"
+    assert all(slot["start"][11:16] != "09:00" for slot in preview.json()["slots"])
+    assert client.delete(
+        f"/api/tools/technicians/tech-1/time-off/{time_off.json()['id']}").status_code == 200
+
+    payload["active"] = False
+    updated = client.put("/api/tools/technicians/tech-1", json=payload)
+    assert updated.status_code == 200
+    assert updated.json()["active"] is False

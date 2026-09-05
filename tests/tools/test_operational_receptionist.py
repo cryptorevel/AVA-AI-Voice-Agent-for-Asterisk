@@ -45,7 +45,6 @@ def operational_config(db_path, *, scheduling=True):
                     "max_offered_slots": 3,
                     "business_hours": {day: ["09:00", "17:00"] for day in
                                        ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]},
-                    "technicians": [{"id": "tech-hvac", "skills": ["furnace_repair"]}],
                 },
                 "sms": {"enabled": False, "provider": "twilio"},
             }
@@ -154,6 +153,13 @@ async def test_intent_schema_and_language_state(tmp_path):
 
 
 async def create_booking_prerequisites(db_path, call_id):
+    service = OperationalService(str(db_path))
+    await service.upsert_technician("coreline", {
+        "id": "tech-hvac", "display_name": "tech-hvac", "active": True,
+        "timezone": "America/Vancouver", "service_ids": ["furnace_repair"],
+        "working_hours": {day: [["09:00", "17:00"]] for day in
+                          ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]},
+    }, operational_config(db_path)["tools"]["operational_receptionist"]["service_catalog"])
     ctx, session = context(db_path, {"safety_state": "clear", "service_area_state": "SUPPORTED"}, call_id=call_id)
     customer = await CreateCustomerTool().execute({
         "first_name": "Sam", "phone": "+16045550101", "address": "1 Main St",
@@ -210,8 +216,10 @@ async def test_booking_conflict_and_stale_slot_fail_closed(tmp_path):
 async def test_scheduling_unavailable_is_truthful(tmp_path):
     ctx, _ = context(tmp_path / "disabled.db", {"safety_state": "clear", "service_area_state": "SUPPORTED"}, scheduling=False)
     result = await GetAvailableSlotsTool().execute({"service_code": "furnace_repair", "start_date": "2026-09-06"}, ctx)
-    assert result["status"] == "error"
-    assert "not configured" in result["message"]
+    assert result["status"] == "success"
+    assert result["data"]["status"] == "configuration_required"
+    assert result["data"]["slots"] == []
+    assert "office follow up" in result["message"]
 
 
 @pytest.mark.asyncio
@@ -279,3 +287,196 @@ async def test_sms_success_records_provider_id(tmp_path, monkeypatch):
         "sms": {"enabled": True, "provider": "twilio"}})
     assert result["sent"] is True
     assert result["send_status"] == "queued"
+
+
+def capacity_settings(db_path):
+    return operational_config(db_path)["tools"]["operational_receptionist"]
+
+
+async def configure_capacity(db_path, *, technician_id="tech-1", active=True,
+                             services=None, hours=None, timezone="America/Vancouver"):
+    service = OperationalService(str(db_path))
+    await service.upsert_technician("coreline", {
+        "id": technician_id,
+        "display_name": technician_id,
+        "active": active,
+        "timezone": timezone,
+        "service_ids": services if services is not None else ["furnace_repair"],
+        "working_hours": hours if hours is not None else {
+            day: [["09:00", "17:00"]] for day in ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+        },
+    }, capacity_settings(db_path)["service_catalog"])
+    return service
+
+
+@pytest.mark.asyncio
+async def test_technician_crud_assignments_activation_and_tenant_isolation(tmp_path):
+    db_path = tmp_path / "technicians.db"
+    service = await configure_capacity(db_path, services=["furnace_repair"])
+    created = await service.get_technician("coreline", "tech-1")
+    assert created["display_name"] == "tech-1"
+    assert created["active"] is True
+    assert created["service_ids"] == ["furnace_repair"]
+    assert await service.get_technician("other-org", "tech-1") is None
+
+    updated = await service.upsert_technician("coreline", {
+        **created, "display_name": "North Team", "active": False,
+    }, capacity_settings(db_path)["service_catalog"])
+    assert updated["display_name"] == "North Team"
+    assert updated["active"] is False
+    assert len(await service.list_technicians("coreline")) == 1
+    assert await service.list_technicians("other-org") == []
+
+
+@pytest.mark.asyncio
+async def test_split_working_hours_day_off_and_outside_interval(tmp_path):
+    db_path = tmp_path / "hours.db"
+    service = await configure_capacity(db_path, hours={"mon": [["09:00", "12:00"], ["13:00", "17:00"]]})
+    config = capacity_settings(db_path)
+    result = await service.offer_slots(
+        "coreline", "call-hours", "furnace_repair", "2026-09-07", 1, config,
+        persist_offers=False, now=datetime(2026, 9, 1, tzinfo=ZoneInfo("America/Vancouver")))
+    starts = {slot["start"][11:16] for slot in result["slots"]}
+    assert result["status"] == "available"
+    assert starts == {"09:00", "13:00", "15:00"}
+
+    day_off = await service.offer_slots(
+        "coreline", "call-off", "furnace_repair", "2026-09-08", 1, config,
+        persist_offers=False, now=datetime(2026, 9, 1, tzinfo=ZoneInfo("America/Vancouver")))
+    assert day_off["status"] == "no_capacity"
+    assert day_off["slots"] == []
+
+
+@pytest.mark.asyncio
+async def test_time_off_and_schedule_blocks_remove_capacity_and_can_be_cancelled(tmp_path):
+    db_path = tmp_path / "exceptions.db"
+    service = await configure_capacity(db_path)
+    config = capacity_settings(db_path)
+    time_off = await service.set_technician_exception("coreline", "tech-1", "time_off", {
+        "start_datetime": "2026-09-07T09:00:00-07:00",
+        "end_datetime": "2026-09-07T13:00:00-07:00", "reason": "training"})
+    block = await service.set_technician_exception("coreline", "tech-1", "block", {
+        "start_datetime": "2026-09-07T15:00:00-07:00",
+        "end_datetime": "2026-09-07T17:00:00-07:00", "reason": "vehicle service"})
+    result = await service.offer_slots(
+        "coreline", "call-exceptions", "furnace_repair", "2026-09-07", 1, config,
+        persist_offers=False, now=datetime(2026, 9, 1, tzinfo=ZoneInfo("America/Vancouver")))
+    assert [slot["start"][11:16] for slot in result["slots"]] == ["13:00"]
+    assert {item["reason"] for item in result["diagnostics"]} >= {"time_off", "schedule_block"}
+
+    await service.cancel_technician_exception("coreline", "tech-1", "time_off", time_off["id"])
+    await service.cancel_technician_exception("coreline", "tech-1", "block", block["id"])
+    released = await service.offer_slots(
+        "coreline", "call-released", "furnace_repair", "2026-09-07", 1, config,
+        persist_offers=False, now=datetime(2026, 9, 1, tzinfo=ZoneInfo("America/Vancouver")))
+    assert len(released["slots"]) == 3
+
+
+@pytest.mark.asyncio
+async def test_availability_fail_closed_statuses_for_capacity_eligibility_and_duration(tmp_path):
+    db_path = tmp_path / "fail-closed.db"
+    service = OperationalService(str(db_path))
+    config = capacity_settings(db_path)
+    no_technicians = await service.offer_slots("coreline", "call-none", "furnace_repair", "2026-09-07", 1, config)
+    assert no_technicians["status"] == "configuration_required"
+
+    await configure_capacity(db_path, services=[])
+    no_eligible = await service.offer_slots("coreline", "call-skill", "furnace_repair", "2026-09-07", 1, config)
+    assert no_eligible["status"] == "manual_review_required"
+
+    missing = {**config, "service_catalog": {"furnace_repair": {"enabled": True}}}
+    await configure_capacity(db_path)
+    no_duration = await service.offer_slots("coreline", "call-duration", "furnace_repair", "2026-09-07", 1, missing)
+    assert no_duration["status"] == "configuration_required"
+
+    too_long = {**config, "service_catalog": {"furnace_repair": {"enabled": True, "duration_minutes": 600}}}
+    no_fit = await service.offer_slots(
+        "coreline", "call-long", "furnace_repair", "2026-09-07", 1, too_long,
+        now=datetime(2026, 9, 1, tzinfo=ZoneInfo("America/Vancouver")))
+    assert no_fit["status"] == "no_capacity"
+
+
+@pytest.mark.asyncio
+async def test_buffers_minimum_notice_and_same_day_cutoff_are_deterministic(tmp_path):
+    db_path = tmp_path / "rules.db"
+    service = await configure_capacity(db_path)
+    config = capacity_settings(db_path)
+    config["scheduling"] = {**config["scheduling"], "minimum_notice_minutes": 180,
+                            "travel_buffer_before_minutes": 30, "travel_buffer_after_minutes": 30,
+                            "preparation_buffer_minutes": 30, "same_day_cutoff": "16:00"}
+    result = await service.offer_slots(
+        "coreline", "call-rules", "furnace_repair", "2026-09-07", 1, config,
+        persist_offers=False, now=datetime(2026, 9, 7, 7, 30, tzinfo=ZoneInfo("America/Vancouver")))
+    assert [slot["start"][11:16] for slot in result["slots"]] == ["11:00", "13:00"]
+
+    cutoff = await service.offer_slots(
+        "coreline", "call-cutoff", "furnace_repair", "2026-09-07", 1, config,
+        persist_offers=False, now=datetime(2026, 9, 7, 16, 1, tzinfo=ZoneInfo("America/Vancouver")))
+    assert cutoff["status"] == "no_capacity"
+    assert cutoff["diagnostics"] == [{"date": "2026-09-07", "reason": "same_day_cutoff"}]
+
+
+@pytest.mark.asyncio
+async def test_inactive_and_cross_org_technicians_never_supply_slots(tmp_path):
+    db_path = tmp_path / "isolation.db"
+    service = await configure_capacity(db_path, active=False)
+    config = capacity_settings(db_path)
+    inactive = await service.offer_slots("coreline", "call-inactive", "furnace_repair", "2026-09-07", 1, config)
+    assert inactive["status"] == "configuration_required"
+    await service.upsert_technician("other-org", {
+        "id": "tech-other", "display_name": "Other", "active": True,
+        "timezone": "America/Vancouver", "service_ids": ["furnace_repair"],
+        "working_hours": {"mon": [["09:00", "17:00"]]},
+    }, config["service_catalog"])
+    isolated = await service.offer_slots("coreline", "call-isolated", "furnace_repair", "2026-09-07", 1, config)
+    assert isolated["status"] == "configuration_required"
+
+
+@pytest.mark.asyncio
+async def test_failed_booking_rolls_back_and_cancelled_appointment_releases_capacity(tmp_path):
+    db_path = tmp_path / "rollback.db"
+    ctx, _, customer_id, lead_id = await create_booking_prerequisites(db_path, "call-rollback")
+    start_date = (datetime.now(ZoneInfo("America/Vancouver")) + timedelta(days=1)).date().isoformat()
+    offered = await GetAvailableSlotsTool().execute({"service_code": "furnace_repair", "start_date": start_date}, ctx)
+    token = offered["data"]["slots"][0]["slot_token"]
+    service = OperationalService(str(db_path))
+    with pytest.raises(ValueError):
+        await service.book("other-org", "call-rollback", token, customer_id, lead_id, {}, capacity_settings(db_path))
+    with service._connect() as db:
+        assert db.execute("SELECT count(*) FROM jobs").fetchone()[0] == 0
+        assert db.execute("SELECT count(*) FROM appointments").fetchone()[0] == 0
+
+    booked = await service.book("coreline", "call-rollback", token, customer_id, lead_id,
+                                {"issue_description": "No heat", "urgency": "high"}, capacity_settings(db_path))
+    before_cancel = booked["starts_at"]
+    await service.change_appointment("coreline", "call-cancel", booked["appointment_id"], "cancel")
+    released = await service.offer_slots("coreline", "call-after-cancel", "furnace_repair", start_date, 1,
+                                         capacity_settings(db_path))
+    assert before_cancel in {slot["starts_at"] for slot in released["slots"]}
+
+
+@pytest.mark.asyncio
+async def test_reschedule_revalidates_service_eligibility_and_releases_old_slot(tmp_path):
+    db_path = tmp_path / "reschedule.db"
+    ctx, _, customer_id, lead_id = await create_booking_prerequisites(db_path, "call-original")
+    start_date = (datetime.now(ZoneInfo("America/Vancouver")) + timedelta(days=1)).date().isoformat()
+    first = await GetAvailableSlotsTool().execute({"service_code": "furnace_repair", "start_date": start_date}, ctx)
+    booked = await BookAppointmentTool().execute({
+        "slot_token": first["data"]["slots"][0]["slot_token"], "customer_id": customer_id,
+        "lead_id": lead_id, "issue_description": "No heat", "urgency": "high"}, ctx)
+    old_start = booked["data"]["starts_at"]
+
+    manage_ctx, _ = context(db_path, {"safety_state": "clear", "service_area_state": "SUPPORTED"}, call_id="call-reschedule")
+    replacement = await GetAvailableSlotsTool().execute(
+        {"service_code": "furnace_repair", "start_date": start_date}, manage_ctx)
+    replacement_slot = next(slot for slot in replacement["data"]["slots"] if slot["starts_at"] != old_start)
+    moved = await ManageAppointmentTool().execute({
+        "action": "reschedule", "appointment_id": booked["data"]["appointment_id"],
+        "slot_token": replacement_slot["slot_token"]}, manage_ctx)
+    assert moved["status"] == "success"
+    assert moved["data"]["technician_id"] == "tech-hvac"
+    assert moved["sms"]["sent"] is False
+    assert moved["escalation"]["status"] == "open"
+    available_again = await OperationalService(str(db_path)).offer_slots(
+        "coreline", "call-old-slot", "furnace_repair", start_date, 1, capacity_settings(db_path))
+    assert old_start in {slot["starts_at"] for slot in available_again["slots"]}

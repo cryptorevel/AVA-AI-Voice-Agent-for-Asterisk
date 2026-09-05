@@ -326,10 +326,15 @@ tools:
     scheduling:
       enabled: false
       minimum_notice_minutes: 120
+      same_day_cutoff: ""
       slot_interval_minutes: 60
       max_offered_slots: 3
+      travel_buffer_before_minutes: 0
+      travel_buffer_after_minutes: 0
+      preparation_buffer_minutes: 0
       business_hours: {}
-      technicians: []
+      # Real technician capacity is configured through the authenticated
+      # Admin Tools API and persisted in operations.db. No demo capacity is seeded.
     sms:
       enabled: false
       provider: twilio

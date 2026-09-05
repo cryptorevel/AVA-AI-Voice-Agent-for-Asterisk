@@ -350,13 +350,39 @@ allowlist:
 `create_callback`, and `finalize_receptionist_call`.
 
 The server resolves `organization_id` from configuration, validates entity ownership,
-and records audit events. Leads are idempotent per organization/call. Availability
-returns short-lived opaque slot tokens; `book_appointment` revalidates the token and
-conflicts inside an immediate SQLite transaction before creating the job and
-appointment. A booking result is authoritative only when `booking_confirmed` is true.
-SMS send state is returned separately, so a confirmed appointment never implies a
-message was sent. Safety and service-area checks fail closed, and disabled or incomplete
-scheduling returns an error instead of fabricated availability.
+and records audit events. Leads are idempotent per organization/call. Technician
+capacity is persisted in the operational database and is tenant-scoped: each active
+technician has explicit service assignments, timezone-aware recurring hours, time off,
+and manual schedule blocks. No technicians or availability are seeded automatically.
+
+`get_available_slots` intersects organization business hours with eligible technician
+hours, then subtracts time off, blocks, confirmed appointments, and configured buffers.
+Services without a positive `duration_minutes` are never auto-bookable. The structured
+result uses `available`, `no_capacity`, `configuration_required`,
+`manual_review_required`, `outside_service_area`, or `blocked_by_safety`; every
+non-available capacity result creates an idempotent manual-scheduling escalation instead
+of inviting the model to guess.
+
+Availability returns short-lived opaque slot tokens. `book_appointment` and rescheduling
+revalidate technician state, service eligibility, hours, exceptions, duration, buffers,
+and conflicts inside an immediate SQLite transaction before persisting. A booking result
+is authoritative only when `booking_confirmed` is true. SMS send state is returned
+separately, so a confirmed appointment never implies a message was sent.
+
+Authenticated administrators configure capacity through `/api/tools/technicians`:
+
+- `POST /api/tools/technicians` creates a neutral-id technician such as `tech-1`.
+- `PUT /api/tools/technicians/{id}` updates active state, service assignments, timezone,
+  and recurring `working_hours` (weekday keys with one or more `HH:MM` pairs).
+- `POST`/`DELETE` on `/{id}/time-off` and `/{id}/blocks` manage capacity exceptions.
+- `GET /{id}/appointments` lists upcoming assigned appointments.
+- `GET /{id}/availability-preview` explains available slots and exclusion reasons without
+  creating caller-bookable offer tokens.
+
+Scheduling supports deterministic `minimum_notice_minutes`, `same_day_cutoff`,
+`travel_buffer_before_minutes`, `travel_buffer_after_minutes`, and
+`preparation_buffer_minutes`. Business hours remain organization-level limits and never
+create technician capacity by themselves.
 
 `finalize_receptionist_call` stores verified structured facts separately from its
 AI-authored summary. Engine teardown also writes a deterministic fallback artifact if a

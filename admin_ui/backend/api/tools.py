@@ -1850,3 +1850,133 @@ async def patch_tools_settings(body: Dict[str, Any]):
         farewell_hangup_delay_sec=delay if isinstance(delay, (int, float)) else None,
         settings=_safe_jsonable(_non_tool_settings(cfg)),
     )
+
+
+# Sarah technician-capacity administration lives under the authenticated Tools
+# API so it reuses the existing admin application and authorization boundary.
+class TechnicianPayload(BaseModel):
+    id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+    display_name: str = Field(default="", max_length=120)
+    active: bool = True
+    timezone: str = Field(default="America/Vancouver", min_length=1, max_length=80)
+    service_ids: List[str] = Field(default_factory=list)
+    working_hours: Dict[str, List[List[str]]] = Field(default_factory=dict)
+
+
+class TechnicianExceptionPayload(BaseModel):
+    start_datetime: str
+    end_datetime: str
+    reason: str = Field(default="", max_length=300)
+
+
+def _operational_capacity_service():
+    import sys
+
+    cfg = _load_cfg()
+    operational = ((cfg.get("tools") or {}).get("operational_receptionist") or {})
+    organization_id = str(operational.get("organization_id") or "").strip()
+    if not organization_id:
+        raise HTTPException(status_code=409, detail="Operational receptionist organization is not configured")
+    project_root = os.environ.get("PROJECT_ROOT") or os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
+    from src.operations.service import get_operational_service
+
+    db_path = str(operational.get("database_path") or "/app/data/operator/operations.db")
+    return operational, organization_id, get_operational_service(db_path)
+
+
+@router.get("/technicians")
+async def list_sarah_technicians():
+    _, org, service = _operational_capacity_service()
+    return {"organization_id": org, "technicians": await service.list_technicians(org)}
+
+
+@router.get("/technicians/{technician_id}")
+async def get_sarah_technician(technician_id: str):
+    _, org, service = _operational_capacity_service()
+    record = await service.get_technician(org, technician_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Technician not found")
+    return record
+
+
+@router.post("/technicians", status_code=201)
+async def create_sarah_technician(payload: TechnicianPayload):
+    config, org, service = _operational_capacity_service()
+    if await service.get_technician(org, payload.id):
+        raise HTTPException(status_code=409, detail="Technician already exists")
+    try:
+        return await service.upsert_technician(org, payload.model_dump(), config.get("service_catalog") or {})
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.put("/technicians/{technician_id}")
+async def update_sarah_technician(technician_id: str, payload: TechnicianPayload):
+    if payload.id != technician_id:
+        raise HTTPException(status_code=400, detail="Path and payload technician ids must match")
+    config, org, service = _operational_capacity_service()
+    try:
+        return await service.upsert_technician(org, payload.model_dump(), config.get("service_catalog") or {})
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/technicians/{technician_id}/time-off", status_code=201)
+async def create_sarah_time_off(technician_id: str, payload: TechnicianExceptionPayload):
+    _, org, service = _operational_capacity_service()
+    try:
+        return await service.set_technician_exception(org, technician_id, "time_off", payload.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.delete("/technicians/{technician_id}/time-off/{entry_id}")
+async def cancel_sarah_time_off(technician_id: str, entry_id: str):
+    _, org, service = _operational_capacity_service()
+    try:
+        return await service.cancel_technician_exception(org, technician_id, "time_off", entry_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/technicians/{technician_id}/blocks", status_code=201)
+async def create_sarah_schedule_block(technician_id: str, payload: TechnicianExceptionPayload):
+    _, org, service = _operational_capacity_service()
+    try:
+        return await service.set_technician_exception(org, technician_id, "block", payload.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.delete("/technicians/{technician_id}/blocks/{entry_id}")
+async def cancel_sarah_schedule_block(technician_id: str, entry_id: str):
+    _, org, service = _operational_capacity_service()
+    try:
+        return await service.cancel_technician_exception(org, technician_id, "block", entry_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/technicians/{technician_id}/appointments")
+async def list_sarah_technician_appointments(technician_id: str, limit: int = 100):
+    _, org, service = _operational_capacity_service()
+    if not await service.get_technician(org, technician_id):
+        raise HTTPException(status_code=404, detail="Technician not found")
+    if limit < 1 or limit > 500:
+        raise HTTPException(status_code=422, detail="limit must be between 1 and 500")
+    return {"appointments": await service.list_upcoming_appointments(org, technician_id, limit)}
+
+
+@router.get("/technicians/{technician_id}/availability-preview")
+async def preview_sarah_technician_availability(technician_id: str, service_code: str,
+                                                start_date: str, days: int = 1):
+    config, org, service = _operational_capacity_service()
+    if not await service.get_technician(org, technician_id):
+        raise HTTPException(status_code=404, detail="Technician not found")
+    if days < 1 or days > 21:
+        raise HTTPException(status_code=422, detail="days must be between 1 and 21")
+    return await service.offer_slots(org, "admin-preview", service_code, start_date, days, config,
+                                     persist_offers=False, technician_id=technician_id)

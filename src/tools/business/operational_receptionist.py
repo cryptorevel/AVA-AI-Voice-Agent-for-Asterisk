@@ -234,14 +234,25 @@ class GetAvailableSlotsTool(OperationalTool):
             config, org, service = self._parts(context)
             state = dict(getattr(await context.get_session(), "operational_state", {}) or {})
             if state.get("safety_state") not in {"clear", None}:
-                raise RuntimeError("Normal booking is stopped by a safety escalation")
+                return {"status": "success", "data": {"status": "blocked_by_safety", "slots": []},
+                        "message": "Normal booking is stopped by a safety escalation."}
             if state.get("service_area_state") != "SUPPORTED":
-                raise RuntimeError("Service area must be confirmed before availability")
-            slots = await service.offer_slots(org, context.call_id, str(parameters["service_code"]),
-                                              str(parameters["start_date"]), int(parameters.get("days_to_search") or 7), config)
-            await self._update_state(context, booking_state="slots_offered")
-            return {"status": "success", "data": {"slots": slots},
-                    "message": "Offer only these slots." if slots else "No slots found; create a callback request."}
+                return {"status": "success", "data": {"status": "outside_service_area", "slots": []},
+                        "message": "Service area must be confirmed before availability."}
+            availability = await service.offer_slots(
+                org, context.call_id, str(parameters["service_code"]),
+                str(parameters["start_date"]), int(parameters.get("days_to_search") or 7), config)
+            escalation = None
+            if availability["status"] != "available":
+                escalation = await service.create_escalation(
+                    org, context.call_id, str(state.get("lead_id") or ""), "manual_scheduling",
+                    availability.get("reason") or "Automated scheduling has no confirmable capacity", "normal")
+                await self._update_state(context, booking_state="manual_review", handoff_state="callback_created")
+            else:
+                await self._update_state(context, booking_state="slots_offered")
+            return {"status": "success", "data": availability, "escalation": escalation,
+                    "message": "Offer only these slots." if availability["status"] == "available" else
+                               "I don't have an appointment time I can confirm right now. I can have the office follow up with you."}
         except Exception as exc:
             return self._error(exc)
 
@@ -304,7 +315,7 @@ class CreateCallbackTool(OperationalTool):
 
     async def execute(self, parameters: Dict[str, Any], context: ToolExecutionContext) -> Dict[str, Any]:
         try:
-            _, org, service = self._parts(context)
+            config, org, service = self._parts(context)
             result = await service.create_escalation(org, context.call_id, str(parameters.get("lead_id") or ""),
                                                      str(parameters["kind"]), str(parameters["reason"]), str(parameters["priority"]))
             await self._update_state(context, handoff_state="callback_created")
@@ -323,7 +334,7 @@ class ManageAppointmentTool(OperationalTool):
 
     async def execute(self, parameters: Dict[str, Any], context: ToolExecutionContext) -> Dict[str, Any]:
         try:
-            _, org, service = self._parts(context)
+            config, org, service = self._parts(context)
             action = str(parameters["action"])
             if action == "lookup":
                 phone = str(parameters.get("phone") or context.caller_number or "")
@@ -334,11 +345,28 @@ class ManageAppointmentTool(OperationalTool):
             if not appointment_id:
                 raise ValueError("appointment_id is required")
             result = await service.change_appointment(org, context.call_id, appointment_id, action,
-                                                      str(parameters.get("slot_token") or ""))
+                                                      str(parameters.get("slot_token") or ""), config)
+            sms = None
+            escalation = None
+            if action == "reschedule":
+                template = str((config.get("sms") or {}).get("confirmation_template") or
+                               "{company}\nYour service appointment is confirmed for {starts_at}.\n"
+                               "Service address: {address}.\nConfirmation: {confirmation_ref}")
+                body = template.format(company=str(config.get("company_name") or "Coreline Comfort Solution"),
+                                       starts_at=result["starts_at"], ends_at=result["ends_at"],
+                                       address=result["customer_address"],
+                                       confirmation_ref=result["confirmation_ref"])
+                sms = await service.send_sms(org, appointment_id, result["customer_phone"], body, config)
+                if not sms["sent"]:
+                    escalation = await service.create_escalation(
+                        org, context.call_id, "", "sms_failure",
+                        "Rescheduled appointment confirmation SMS was not sent", "normal")
             await self._update_state(context, appointment_id=appointment_id,
                                      booking_state="cancelled" if action == "cancel" else "rescheduled")
-            return {"status": "success", "data": result,
-                    "message": "Appointment cancelled." if action == "cancel" else "Appointment rescheduled."}
+            return {"status": "success", "data": result, "sms": sms, "escalation": escalation,
+                    "message": "Appointment cancelled." if action == "cancel" else
+                               ("Appointment rescheduled and SMS sent." if sms and sms["sent"] else
+                                "Appointment rescheduled, but SMS was not sent; say that accurately.")}
         except Exception as exc:
             return self._error(exc)
 

@@ -44,9 +44,20 @@ override them.
 - `service_area.supported_cities`, `supported_postal_prefixes`, and `excluded_cities`
   drive the deterministic `SUPPORTED`, `OUTSIDE_SERVICE_AREA`, or `REQUIRES_REVIEW`
   result. Unknown areas require review and cannot be booked.
-- `scheduling.enabled`, `business_hours`, `technicians[].skills`, minimum notice, and
-  slot interval define internal capacity. No availability is returned until hours and a
-  matching technician are configured.
+- `scheduling.enabled` and `business_hours` define organization-level boundaries only.
+  They do not create technician capacity.
+- Real technicians, service assignments, recurring work hours, time off, and schedule
+  blocks are tenant-scoped records in `operations.db`, managed through the authenticated
+  `/api/tools/technicians` endpoints. Neutral ids such as `tech-1` are supported, and no
+  production technicians are seeded automatically.
+- `minimum_notice_minutes`, `same_day_cutoff`, `slot_interval_minutes`,
+  `travel_buffer_before_minutes`, `travel_buffer_after_minutes`, and
+  `preparation_buffer_minutes` are deterministic scheduling constraints. Buffer values
+  are non-negative whole minutes; `same_day_cutoff` is a local `HH:MM` value or empty.
+- An enabled service needs a positive `duration_minutes` and at least one active,
+  explicitly eligible technician with recurring hours before automatic booking is
+  possible. Missing configuration produces `configuration_required`; no eligible
+  technician produces `manual_review_required`.
 - `sms.enabled` supports `provider: twilio`. Credentials are read only from the named
   environment variables (`TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, and
   `TWILIO_SMS_FROM` by default); never place credential values in YAML.
