@@ -1396,6 +1396,15 @@ async def _persist_cfg(cfg: Dict[str, Any]) -> dict:
     return await config_api.reconcile_apply_result_with_engine_state(result)
 
 
+async def _persist_operational_cfg(operational: Dict[str, Any]) -> dict:
+    """Persist one operational-receptionist subtree without replacing unrelated config."""
+    full_config = _load_cfg()
+    tools = dict(full_config.get("tools") or {})
+    tools["operational_receptionist"] = operational
+    full_config["tools"] = tools
+    return await _persist_cfg(full_config)
+
+
 def _apply_metadata(result: Optional[dict]) -> Dict[str, Any]:
     result = result or {}
     apply_required = bool(result.get("apply_required", True))
@@ -2012,7 +2021,7 @@ async def update_scheduling_settings(payload: OrganizationSchedulingPayload):
             "message": "Scheduling cannot be enabled until configuration is ready",
             "missing": readiness["missing"],
         })
-    apply_result = await _persist_cfg(proposed)
+    apply_result = await _persist_operational_cfg(proposed)
     after = _settings_view(proposed, readiness)
     changed = [key for key in after if key not in {"configured", "readiness"} and before.get(key) != after.get(key)]
     if changed:
@@ -2058,7 +2067,7 @@ async def _save_scheduling_service(service_id: str, payload: SchedulingServicePa
     })
     catalog[service_id] = current
     config["service_catalog"] = catalog
-    apply_result = await _persist_cfg(config)
+    apply_result = await _persist_operational_cfg(config)
     await _audit_admin_configuration(service, org, "service_catalog_updated", [service_id])
     return {"service": payload.model_dump(), **_apply_metadata(apply_result)}
 

@@ -810,7 +810,7 @@ def test_scheduling_settings_read_update_and_enable_readiness_gate(monkeypatch, 
         return {"apply_required": True, "restart_required": True, "recommended_apply_method": "restart"}
 
     monkeypatch.setattr(tools_api, "_operational_capacity_service", lambda: (config, "org-admin", service))
-    monkeypatch.setattr(tools_api, "_persist_cfg", persist)
+    monkeypatch.setattr(tools_api, "_persist_operational_cfg", persist)
     app = FastAPI(); app.include_router(tools_api.router, prefix="/api/tools")
     client = TestClient(app)
 
@@ -830,6 +830,26 @@ def test_scheduling_settings_read_update_and_enable_readiness_gate(monkeypatch, 
     assert saved.status_code == 200, saved.text
     assert saved.json()["timezone"] == "Pacific/Auckland"
     assert writes[0]["scheduling"]["business_hours"]["sun"] == []
+
+
+@pytest.mark.asyncio
+async def test_operational_settings_persistence_preserves_unrelated_configuration(monkeypatch):
+    full_config = {
+        "providers": {"existing": {"enabled": True}},
+        "tools": {"another_tool": {"enabled": True}, "operational_receptionist": {"timezone": "UTC"}},
+    }
+    captured = []
+
+    async def persist(value):
+        captured.append(value)
+        return {"apply_required": False}
+
+    monkeypatch.setattr(tools_api, "_load_cfg", lambda: copy.deepcopy(full_config))
+    monkeypatch.setattr(tools_api, "_persist_cfg", persist)
+    await tools_api._persist_operational_cfg({"timezone": "Pacific/Auckland"})
+    assert captured[0]["providers"] == full_config["providers"]
+    assert captured[0]["tools"]["another_tool"] == {"enabled": True}
+    assert captured[0]["tools"]["operational_receptionist"] == {"timezone": "Pacific/Auckland"}
 
 
 def test_technician_timezone_inherits_organization_and_override_is_persisted(monkeypatch, tmp_path):
@@ -865,7 +885,7 @@ def test_generic_service_catalog_admin_has_no_domain_specific_ids(monkeypatch, t
         return {"apply_required": False, "restart_required": False, "recommended_apply_method": "none"}
 
     monkeypatch.setattr(tools_api, "_operational_capacity_service", lambda: (config, "org-admin", service))
-    monkeypatch.setattr(tools_api, "_persist_cfg", persist)
+    monkeypatch.setattr(tools_api, "_persist_operational_cfg", persist)
     app = FastAPI(); app.include_router(tools_api.router, prefix="/api/tools")
     client = TestClient(app)
     payload = {"id": "arbitrary-service", "display_name": "Arbitrary Service", "active": True,
