@@ -9789,6 +9789,42 @@ class Engine:
                 outcome = "transferred"
             elif not session.conversation_history:
                 outcome = "abandoned"
+
+            # Persist a deterministic operational artifact even when the model did
+            # not explicitly finalize before a caller hangup. The configured
+            # organization remains server-authoritative and is never model supplied.
+            try:
+                tool_config = self._tool_config_for_session(session)
+                operational_config = (tool_config.get("tools") or {}).get("operational_receptionist") or {}
+                if operational_config.get("enabled") and operational_config.get("organization_id"):
+                    from src.operations.service import get_operational_service
+
+                    operational_state = dict(getattr(session, "operational_state", {}) or {})
+                    summary_parts = [
+                        f"Intent: {operational_state.get('intent')}" if operational_state.get("intent") else "",
+                        f"Service: {operational_state.get('service')}" if operational_state.get("service") else "",
+                        f"Urgency: {operational_state.get('urgency')}" if operational_state.get("urgency") else "",
+                        f"Outcome: {operational_state.get('booking_state') or outcome}",
+                    ]
+                    operations = get_operational_service(
+                        str(operational_config.get("database_path") or "/app/data/operator/operations.db")
+                    )
+                    await operations.save_artifacts(
+                        str(operational_config["organization_id"]),
+                        call_id,
+                        {
+                            "transcript": session.conversation_history or [],
+                            "verified_facts": operational_state,
+                            "ai_summary": "; ".join(part for part in summary_parts if part),
+                            "technician_brief": operational_state.get("technician_brief", ""),
+                            "languages": [operational_state.get("detected_language")]
+                            if operational_state.get("detected_language") else [],
+                            "outcome": "booked" if operational_state.get("booking_state") == "confirmed"
+                            else operational_state.get("booking_state") or outcome,
+                        },
+                    )
+            except Exception:
+                logger.warning("Operational call artifact persistence failed", call_id=call_id, exc_info=True)
             
             # Calculate latency stats
             turn_latencies = getattr(session, 'turn_latencies_ms', []) or []

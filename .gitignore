@@ -322,6 +322,13 @@ data/**/*.db-shm
 data/operator/.migration.lock
 !data/.gitkeep
 
+# Host-local deployment/runtime state (never commit operational data or overrides)
+/data/operator/
+/data/asterisk_status.json
+/data/provider_patterns.json
+/.preflight-ok
+/docker-compose.override.yml
+
 # Custom (community) model entries — user-specific, persists across upgrades
 data/custom_models.json
 data/custom_models.json.lock

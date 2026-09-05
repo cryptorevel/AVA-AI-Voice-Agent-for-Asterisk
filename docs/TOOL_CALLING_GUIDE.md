@@ -338,6 +338,31 @@ tools:
 
 ### Business Tools
 
+#### Operational Receptionist
+
+The opt-in operational suite turns a call into tenant-scoped business records without
+giving the model database access. Add only the required names to an Agent's tool
+allowlist:
+
+`classify_intent`, `identify_customer`, `create_customer`, `create_lead`,
+`get_service_catalog`, `check_safety_rules`, `check_service_area`,
+`get_available_slots`, `book_appointment`, `manage_appointment`,
+`create_callback`, and `finalize_receptionist_call`.
+
+The server resolves `organization_id` from configuration, validates entity ownership,
+and records audit events. Leads are idempotent per organization/call. Availability
+returns short-lived opaque slot tokens; `book_appointment` revalidates the token and
+conflicts inside an immediate SQLite transaction before creating the job and
+appointment. A booking result is authoritative only when `booking_confirmed` is true.
+SMS send state is returned separately, so a confirmed appointment never implies a
+message was sent. Safety and service-area checks fail closed, and disabled or incomplete
+scheduling returns an error instead of fabricated availability.
+
+`finalize_receptionist_call` stores verified structured facts separately from its
+AI-authored summary. Engine teardown also writes a deterministic fallback artifact if a
+caller hangs up before explicit finalization.
+
+
 #### 5. Request Transcript (Caller-Initiated)
 
 **Purpose**: Caller requests email transcript during call

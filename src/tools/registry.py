@@ -647,6 +647,13 @@ Tool Definitions:
             self.register(MicrosoftCalendarTool)
         except ImportError as e:
             logger.warning(f"Could not import MicrosoftCalendarTool: {e}")
+
+        try:
+            from src.tools.business.operational_receptionist import OPERATIONAL_TOOL_CLASSES
+            for tool_class in OPERATIONAL_TOOL_CLASSES:
+                self.register(tool_class)
+        except ImportError as e:
+            logger.warning(f"Could not import operational receptionist tools: {e}")
         
         # Future tools will be registered here:
         # from src.tools.telephony.voicemail import SendToVoicemailTool

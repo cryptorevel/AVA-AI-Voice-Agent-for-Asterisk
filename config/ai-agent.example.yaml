@@ -305,3 +305,37 @@ llm:
   initial_greeting: "Hello, how can I help you today?"
   prompt: "You are a concise and helpful voice assistant. Keep replies under 20 words unless asked for detail."
   model: "gpt-4o"
+
+# Opt-in operational receptionist domain. This fails closed until an operator
+# supplies verified coverage, schedule capacity, and messaging credentials.
+tools:
+  operational_receptionist:
+    enabled: false
+    organization_id: ""
+    company_name: ""
+    database_path: "/app/data/operator/operations.db"
+    timezone: "America/Vancouver"
+    service_catalog:
+      furnace_repair:
+        enabled: true
+        duration_minutes: 120
+    service_area:
+      supported_cities: []
+      supported_postal_prefixes: []
+      excluded_cities: []
+    scheduling:
+      enabled: false
+      minimum_notice_minutes: 120
+      slot_interval_minutes: 60
+      max_offered_slots: 3
+      business_hours: {}
+      technicians: []
+    sms:
+      enabled: false
+      provider: twilio
+      account_sid_env: TWILIO_ACCOUNT_SID
+      auth_token_env: TWILIO_AUTH_TOKEN
+      from_number_env: TWILIO_SMS_FROM
+      confirmation_template: >-
+        {company}\nYour service appointment is confirmed for {starts_at}.\nService
+        address: {address}.\nConfirmation: {confirmation_ref}

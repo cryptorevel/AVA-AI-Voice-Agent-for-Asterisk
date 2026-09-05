@@ -188,6 +188,55 @@ def _response_done_event(response_id="resp-1"):
     }
 
 
+@pytest.mark.asyncio
+async def test_fragmented_function_arguments_wait_for_done_event(openai_config):
+    provider = OpenAIRealtimeProvider(openai_config, on_event=AsyncMock())
+    provider._call_id = "call-fragmented"
+    handled = []
+
+    async def fake_handle(event):
+        handled.append(event)
+
+    provider._handle_function_call = fake_handle
+    partial = _function_call_event("resp-fragmented", "tool-call-1", "classify_intent")
+    partial["item"]["arguments"] = "{"
+    await provider._handle_event(partial)
+    await asyncio.sleep(0)
+    assert handled == []
+
+    await provider._handle_event({
+        "type": "response.function_call_arguments.done",
+        "response_id": "resp-fragmented",
+        "call_id": "tool-call-1",
+        "arguments": '{"intent":"hvac_service"}',
+    })
+    await asyncio.sleep(0)
+    assert len(handled) == 1
+    assert handled[0]["item"]["arguments"] == '{"intent":"hvac_service"}'
+
+
+@pytest.mark.asyncio
+async def test_arguments_done_before_output_item_is_reconciled(openai_config):
+    provider = OpenAIRealtimeProvider(openai_config, on_event=AsyncMock())
+    provider._call_id = "call-reordered"
+    handled = []
+
+    async def fake_handle(event):
+        handled.append(event)
+
+    provider._handle_function_call = fake_handle
+    await provider._handle_event({
+        "type": "response.function_call_arguments.done", "call_id": "tool-call-2",
+        "arguments": '{"confidence":0.9}',
+    })
+    partial = _function_call_event("resp-reordered", "tool-call-2", "classify_intent")
+    partial["item"]["arguments"] = "{"
+    await provider._handle_event(partial)
+    await asyncio.sleep(0)
+    assert len(handled) == 1
+    assert handled[0]["item"]["arguments"] == '{"confidence":0.9}'
+
+
 class _OpenWebSocket:
     state = SimpleNamespace(name="OPEN")
 

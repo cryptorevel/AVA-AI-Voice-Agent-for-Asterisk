@@ -140,6 +140,12 @@ class OpenAIRealtimeProvider(AIProviderInterface):
         # in turn causes the LLM to retry and duplicate side-effectful tool calls (e.g. creating
         # multiple calendar events). See _handle_function_call() for the wait logic.
         self._response_done_events: dict[str, asyncio.Event] = {}
+        # GA Realtime may deliver response.output_item.done before the final
+        # function-argument payload. Keep incomplete items until the matching
+        # response.function_call_arguments.done arrives.
+        self._pending_function_call_events: dict[str, dict] = {}
+        self._completed_function_arguments: dict[str, str] = {}
+        self._dispatched_function_call_ids: set[str] = set()
         # Recently-observed function_call IDs (call_id -> monotonic timestamp). Used by the
         # top-level error handler to decide whether an "invalid_tool_call_id" from the server
         # refers to a known-benign race we just waited through (downgrade to warning) or to
@@ -1045,6 +1051,9 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                 for _evt in self._response_done_events.values():
                     _evt.set()
                 self._response_done_events.clear()
+                self._pending_function_call_events.clear()
+                self._completed_function_arguments.clear()
+                self._dispatched_function_call_ids.clear()
             except Exception:
                 logger.debug("Failed to release response.done sentinels on stop_session", exc_info=True)
             self.websocket = None
@@ -2338,6 +2347,22 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                 )
             return
 
+        if event_type == "response.function_call_arguments.done":
+            function_call_id = str(event.get("call_id") or "")
+            if not function_call_id or function_call_id in self._dispatched_function_call_ids:
+                return
+            arguments = event.get("arguments")
+            if not isinstance(arguments, str):
+                return
+            pending_event = self._pending_function_call_events.pop(function_call_id, None)
+            if pending_event is None:
+                self._completed_function_arguments[function_call_id] = arguments
+                return
+            pending_item = dict(pending_event.get("item") or {})
+            pending_item["arguments"] = arguments
+            event = {**pending_event, "item": pending_item}
+            event_type = "response.output_item.done"
+
         # Handle function calls from response.output_item.done events
         # This is the correct event per OpenAI Realtime API spec
         if event_type == "response.output_item.done":
@@ -2345,6 +2370,28 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             if item.get("type") == "function_call":
                 call_id_field = item.get("call_id")
                 function_name = item.get("name")
+                completed_arguments = self._completed_function_arguments.pop(str(call_id_field or ""), None)
+                if completed_arguments is not None:
+                    item = {**item, "arguments": completed_arguments}
+                    event = {**event, "item": item}
+                try:
+                    parsed_arguments = json.loads(item.get("arguments", "{}"))
+                    if not isinstance(parsed_arguments, dict):
+                        raise ValueError("function arguments must be an object")
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    if call_id_field:
+                        self._pending_function_call_events[str(call_id_field)] = dict(event)
+                        logger.debug(
+                            "Waiting for completed OpenAI function arguments",
+                            call_id=self._call_id,
+                            function_call_id=call_id_field,
+                            function_name=function_name,
+                        )
+                    return
+                if call_id_field in self._dispatched_function_call_ids:
+                    return
+                if call_id_field:
+                    self._dispatched_function_call_ids.add(str(call_id_field))
                 # Register a response.done sentinel for this response BEFORE we dispatch
                 # the tool handler. The handler will await this event before submitting
                 # function_call_output, so the parent response has time to commit to the
@@ -2780,6 +2827,9 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             for _evt in self._response_done_events.values():
                 _evt.set()
             self._response_done_events.clear()
+            self._pending_function_call_events.clear()
+            self._completed_function_arguments.clear()
+            self._dispatched_function_call_ids.clear()
         except Exception:
             logger.debug("Failed to release response.done sentinels on reconnect", exc_info=True)
         backoff = 0.5

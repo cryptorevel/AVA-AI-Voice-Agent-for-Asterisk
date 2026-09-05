@@ -38,3 +38,9 @@ try:
     __all__.append("MicrosoftCalendarTool")
 except ImportError:
     pass
+
+try:
+    from src.tools.business.operational_receptionist import OPERATIONAL_TOOL_CLASSES
+    __all__.append("OPERATIONAL_TOOL_CLASSES")
+except ImportError:
+    pass

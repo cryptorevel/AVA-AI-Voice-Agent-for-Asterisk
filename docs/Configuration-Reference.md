@@ -33,6 +33,28 @@ cause an unnecessary reconnect.
 
 ## Configuration Architecture
 
+### Operational receptionist
+
+`tools.operational_receptionist` enables tenant-scoped inbound customer, lead, job,
+appointment, messaging, escalation, summary, and audit persistence. It is disabled by
+default. `organization_id` and `database_path` are server-owned; model arguments cannot
+override them.
+
+- `service_catalog.<code>.enabled` and `duration_minutes` define offerable work.
+- `service_area.supported_cities`, `supported_postal_prefixes`, and `excluded_cities`
+  drive the deterministic `SUPPORTED`, `OUTSIDE_SERVICE_AREA`, or `REQUIRES_REVIEW`
+  result. Unknown areas require review and cannot be booked.
+- `scheduling.enabled`, `business_hours`, `technicians[].skills`, minimum notice, and
+  slot interval define internal capacity. No availability is returned until hours and a
+  matching technician are configured.
+- `sms.enabled` supports `provider: twilio`. Credentials are read only from the named
+  environment variables (`TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, and
+  `TWILIO_SMS_FROM` by default); never place credential values in YAML.
+
+The complete fail-closed example is in `config/ai-agent.example.yaml`. The SQLite file
+uses WAL mode and owner-only permissions. Keep it under the persistent `data/operator`
+mount and back it up with the other operator databases.
+
 Starting in v4.0, the project added a **modular pipeline architecture** alongside monolithic provider support:
 
 ### Monolithic Providers

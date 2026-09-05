@@ -144,3 +144,10 @@ Recreate `ai_engine` and `admin_ui` after credential changes. See
 
 - Transport mode / pipelines / providers / barge-in / streaming: `config/ai-agent.yaml`
 - Secrets + host wiring + operational knobs: `.env`
+# Operational Receptionist SMS
+
+| Variable | Required | Description |
+|---|---:|---|
+| `TWILIO_ACCOUNT_SID` | When Twilio SMS is enabled | Twilio account identifier used by the confirmation-message adapter. |
+| `TWILIO_AUTH_TOKEN` | When Twilio SMS is enabled | Twilio API credential. Store only in `.env` or an equivalent secret provider. |
+| `TWILIO_SMS_FROM` | When Twilio SMS is enabled | Verified SMS-capable Twilio sender in E.164 format. |

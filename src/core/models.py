@@ -195,6 +195,9 @@ class CallSession:
     # Pre-call tool results (Milestone 24) - CRM lookup data injected into prompts
     pre_call_results: Dict[str, str] = field(default_factory=dict)  # {variable_name: value}
 
+    # Durable business workflow references and state for operational receptionist tools.
+    operational_state: Dict[str, Any] = field(default_factory=dict)
+
     # Opt-in, bounded enrichment fields. These never control caller identity,
     # routing, consent, transfer, disposition, or external-dialer state.
     call_metadata: Dict[str, str] = field(default_factory=dict)
