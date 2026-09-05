@@ -794,6 +794,87 @@ def test_sarah_technician_admin_crud_exceptions_and_preview(monkeypatch, tmp_pat
     assert updated.json()["active"] is False
 
 
+def test_scheduling_settings_read_update_and_enable_readiness_gate(monkeypatch, tmp_path):
+    from src.operations.service import OperationalService
+
+    service = OperationalService(str(tmp_path / "operations.db"))
+    config = {
+        "timezone": "UTC", "service_catalog": {},
+        "scheduling": {"enabled": False, "business_hours": {"mon": [["09:00", "17:00"]]}},
+    }
+    writes = []
+
+    async def persist(value):
+        writes.append(value)
+        config.clear(); config.update(value)
+        return {"apply_required": True, "restart_required": True, "recommended_apply_method": "restart"}
+
+    monkeypatch.setattr(tools_api, "_operational_capacity_service", lambda: (config, "org-admin", service))
+    monkeypatch.setattr(tools_api, "_persist_cfg", persist)
+    app = FastAPI(); app.include_router(tools_api.router, prefix="/api/tools")
+    client = TestClient(app)
+
+    assert client.get("/api/tools/scheduling/settings").json()["readiness"]["ready"] is False
+    payload = {
+        "timezone": "Pacific/Auckland", "business_hours": {"mon": [["08:00", "16:00"]]},
+        "scheduling_enabled": True, "minimum_notice_minutes": 30, "same_day_cutoff": "12:00",
+        "travel_buffer_before_minutes": 10, "travel_buffer_after_minutes": 15,
+        "preparation_buffer_minutes": 5,
+    }
+    blocked = client.put("/api/tools/scheduling/settings", json=payload)
+    assert blocked.status_code == 409
+    assert "active_technician" in blocked.json()["detail"]["missing"]
+    assert writes == []
+    payload["scheduling_enabled"] = False
+    saved = client.put("/api/tools/scheduling/settings", json=payload)
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["timezone"] == "Pacific/Auckland"
+    assert writes[0]["scheduling"]["business_hours"]["sun"] == []
+
+
+def test_technician_timezone_inherits_organization_and_override_is_persisted(monkeypatch, tmp_path):
+    from src.operations.service import OperationalService
+
+    service = OperationalService(str(tmp_path / "operations.db"))
+    config = {"timezone": "Pacific/Auckland", "service_catalog": {}}
+    monkeypatch.setattr(tools_api, "_operational_capacity_service", lambda: (config, "org-admin", service))
+    app = FastAPI(); app.include_router(tools_api.router, prefix="/api/tools")
+    client = TestClient(app)
+    payload = {"id": "field-a", "inherit_organization_timezone": True, "service_ids": [], "working_hours": {}}
+    inherited = client.post("/api/tools/technicians", json=payload)
+    assert inherited.status_code == 201, inherited.text
+    assert inherited.json()["timezone"] == "Pacific/Auckland"
+    assert inherited.json()["timezone_override"] is None
+    assert inherited.json()["inherit_organization_timezone"] is True
+    payload.update({"inherit_organization_timezone": False, "timezone": "UTC"})
+    overridden = client.put("/api/tools/technicians/field-a", json=payload)
+    assert overridden.status_code == 200
+    assert overridden.json()["timezone"] == "UTC"
+    assert overridden.json()["timezone_override"] == "UTC"
+
+
+def test_generic_service_catalog_admin_has_no_domain_specific_ids(monkeypatch, tmp_path):
+    from src.operations.service import OperationalService
+
+    service = OperationalService(str(tmp_path / "operations.db"))
+    config = {"timezone": "UTC", "service_catalog": {}, "scheduling": {}}
+
+    async def persist(value):
+        snapshot = yaml.safe_load(yaml.safe_dump(value))
+        config.clear(); config.update(snapshot)
+        return {"apply_required": False, "restart_required": False, "recommended_apply_method": "none"}
+
+    monkeypatch.setattr(tools_api, "_operational_capacity_service", lambda: (config, "org-admin", service))
+    monkeypatch.setattr(tools_api, "_persist_cfg", persist)
+    app = FastAPI(); app.include_router(tools_api.router, prefix="/api/tools")
+    client = TestClient(app)
+    payload = {"id": "arbitrary-service", "display_name": "Arbitrary Service", "active": True,
+               "duration_minutes": 45, "auto_bookable": True}
+    created = client.post("/api/tools/scheduling/services", json=payload)
+    assert created.status_code == 201, created.text
+    assert client.get("/api/tools/scheduling/services").json()["services"] == [payload]
+
+
 def test_sarah_dispatch_calendar_aggregates_filters_and_uses_live_preview(monkeypatch, tmp_path):
     from src.operations.service import OperationalService
 

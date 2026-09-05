@@ -7,6 +7,7 @@ import Dashboard from './pages/Dashboard';
 import CallHistoryPage from './pages/CallHistoryPage';
 import CallSchedulingPage from './pages/CallSchedulingPage';
 import DispatcherCalendarPage from './pages/DispatcherCalendarPage';
+import SchedulingSettingsPage from './pages/SchedulingSettingsPage';
 import axios from 'axios';
 
 // Auth
@@ -158,6 +159,9 @@ function App() {
                                             <Route path="/history" element={<CallHistoryPage />} />
                                             <Route path="/scheduling" element={<CallSchedulingPage />} />
                                             <Route path="/admin/schedule" element={<DispatcherCalendarPage />} />
+                                            <Route path="/admin/settings" element={<SchedulingSettingsPage />} />
+                                            <Route path="/admin/technicians" element={<SchedulingSettingsPage />} />
+                                            <Route path="/admin/services" element={<SchedulingSettingsPage />} />
 
                                             {/* Core Configuration */}
                                             <Route path="/providers" element={<ProvidersPage />} />

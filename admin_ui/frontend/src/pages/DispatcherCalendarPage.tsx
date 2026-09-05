@@ -175,7 +175,7 @@ export default function DispatcherCalendarPage() {
     const [scheduleValues, setScheduleValues] = useState<Record<string, string>>({});
     const [rescheduleAppointment, setRescheduleAppointment] = useState<CalendarEvent | null>(null);
     const [rescheduleSlots, setRescheduleSlots] = useState<Slot[]>([]);
-    const timezoneRef = useRef('America/Vancouver');
+    const timezoneRef = useRef('UTC');
     const range = useMemo(() => rangeFor(anchor, view), [anchor, view]);
 
     const loadCalendar = useCallback(async () => {
@@ -209,7 +209,7 @@ export default function DispatcherCalendarPage() {
     const groupedEvents = useMemo(() => {
         const grouped: Record<string, CalendarEvent[]> = {};
         for (const event of data?.events || [])
-            (grouped[dayKey(event.start, data?.timezone || 'America/Vancouver')] ||= []).push(
+            (grouped[dayKey(event.start, data?.timezone || 'UTC')] ||= []).push(
                 event
             );
         return grouped;
@@ -235,7 +235,7 @@ export default function DispatcherCalendarPage() {
             const timezone =
                 data?.technicians.find(item => item.id === technicianId)?.timezone ||
                 data?.timezone ||
-                'America/Vancouver';
+                'UTC';
             await axios.post(
                 `/api/tools/technicians/${encodeURIComponent(technicianId)}/${exceptionType}`,
                 {
@@ -353,7 +353,7 @@ export default function DispatcherCalendarPage() {
         }
     };
     const shift = view === 'day' ? 1 : 7;
-    const timezone = data?.timezone || 'America/Vancouver';
+    const timezone = data?.timezone || 'UTC';
     const businessHoursLabel = Object.entries(data?.business_hours || {})
         .map(([day, intervals]) => {
             const normalized = Array.isArray(intervals[0])

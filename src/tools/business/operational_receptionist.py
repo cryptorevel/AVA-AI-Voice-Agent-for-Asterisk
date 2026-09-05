@@ -273,7 +273,7 @@ class BookAppointmentTool(OperationalTool):
                                         str(parameters["customer_id"]), str(parameters["lead_id"]), parameters, config)
             template = str((config.get("sms") or {}).get("confirmation_template") or
                            "{company}\nYour service appointment is confirmed for {starts_at}.\nService address: {address}.\nConfirmation: {confirmation_ref}")
-            body = template.format(company=str(config.get("company_name") or "Coreline Comfort Solution"),
+            body = template.format(company=str(config.get("company_name") or "Service Team"),
                                    starts_at=booked["starts_at"], ends_at=booked["ends_at"],
                                    address=booked["customer_address"], confirmation_ref=booked["confirmation_ref"])
             sms = await service.send_sms(org, booked["appointment_id"], booked["customer_phone"], body, config)
@@ -319,7 +319,7 @@ class CreateCallbackTool(OperationalTool):
             result = await service.create_escalation(org, context.call_id, str(parameters.get("lead_id") or ""),
                                                      str(parameters["kind"]), str(parameters["reason"]), str(parameters["priority"]))
             await self._update_state(context, handoff_state="callback_created")
-            return {"status": "success", "data": result, "message": "A callback request was created for the Coreline team."}
+            return {"status": "success", "data": result, "message": "A callback request was created for the office team."}
         except Exception as exc:
             return self._error(exc)
 
@@ -352,7 +352,7 @@ class ManageAppointmentTool(OperationalTool):
                 template = str((config.get("sms") or {}).get("confirmation_template") or
                                "{company}\nYour service appointment is confirmed for {starts_at}.\n"
                                "Service address: {address}.\nConfirmation: {confirmation_ref}")
-                body = template.format(company=str(config.get("company_name") or "Coreline Comfort Solution"),
+                body = template.format(company=str(config.get("company_name") or "Service Team"),
                                        starts_at=result["starts_at"], ends_at=result["ends_at"],
                                        address=result["customer_address"],
                                        confirmation_ref=result["confirmation_ref"])

@@ -16,6 +16,7 @@ import time
 import ipaddress
 import socket
 import yaml
+from zoneinfo import ZoneInfo
 from string import Formatter
 from urllib.parse import urlparse, urljoin
 from settings import get_setting
@@ -1858,9 +1859,29 @@ class TechnicianPayload(BaseModel):
     id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
     display_name: str = Field(default="", max_length=120)
     active: bool = True
-    timezone: str = Field(default="America/Vancouver", min_length=1, max_length=80)
+    inherit_organization_timezone: bool = True
+    timezone: str = Field(default="", max_length=80)
     service_ids: List[str] = Field(default_factory=list)
     working_hours: Dict[str, List[List[str]]] = Field(default_factory=dict)
+
+
+class OrganizationSchedulingPayload(BaseModel):
+    timezone: str = Field(min_length=1, max_length=80)
+    business_hours: Dict[str, List[List[str]]]
+    scheduling_enabled: bool = False
+    minimum_notice_minutes: Optional[int] = Field(default=None, ge=0, le=10080)
+    same_day_cutoff: Optional[str] = None
+    travel_buffer_before_minutes: Optional[int] = Field(default=None, ge=0, le=1440)
+    travel_buffer_after_minutes: Optional[int] = Field(default=None, ge=0, le=1440)
+    preparation_buffer_minutes: Optional[int] = Field(default=None, ge=0, le=1440)
+
+
+class SchedulingServicePayload(BaseModel):
+    id: str = Field(min_length=1, max_length=80, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+    display_name: str = Field(min_length=1, max_length=160)
+    active: bool = True
+    duration_minutes: Optional[int] = Field(default=None, ge=1, le=1440)
+    auto_bookable: bool = False
 
 
 class TechnicianExceptionPayload(BaseModel):
@@ -1891,6 +1912,167 @@ def _operational_capacity_service():
     return operational, organization_id, get_operational_service(db_path)
 
 
+_SCHEDULING_WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
+
+def _validate_clock(value: str, field: str) -> str:
+    raw = str(value or "").strip()
+    if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", raw):
+        raise HTTPException(status_code=422, detail=f"{field} must be HH:MM")
+    return raw
+
+
+def _normalize_business_hours(raw: Dict[str, List[List[str]]]) -> Dict[str, List[List[str]]]:
+    unknown = sorted(set(raw) - set(_SCHEDULING_WEEKDAYS))
+    if unknown:
+        raise HTTPException(status_code=422, detail=f"Unknown weekdays: {', '.join(unknown)}")
+    normalized: Dict[str, List[List[str]]] = {}
+    for day in _SCHEDULING_WEEKDAYS:
+        windows = raw.get(day) or []
+        clean: List[List[str]] = []
+        previous_end = ""
+        for index, window in enumerate(windows):
+            if not isinstance(window, list) or len(window) != 2:
+                raise HTTPException(status_code=422, detail=f"{day} interval {index + 1} must contain start and end")
+            start = _validate_clock(window[0], f"{day} start")
+            end = _validate_clock(window[1], f"{day} end")
+            if start >= end:
+                raise HTTPException(status_code=422, detail=f"{day} start must be before end")
+            if previous_end and start < previous_end:
+                raise HTTPException(status_code=422, detail=f"{day} intervals must not overlap")
+            clean.append([start, end])
+            previous_end = end
+        normalized[day] = clean
+    return normalized
+
+
+def _settings_view(config: Dict[str, Any], readiness: Dict[str, Any]) -> Dict[str, Any]:
+    scheduling = config.get("scheduling") or {}
+    fields = (
+        "minimum_notice_minutes", "same_day_cutoff", "travel_buffer_before_minutes",
+        "travel_buffer_after_minutes", "preparation_buffer_minutes",
+    )
+    return {
+        "timezone": str(config.get("timezone") or ""),
+        "business_hours": scheduling.get("business_hours") or {},
+        "scheduling_enabled": bool(scheduling.get("enabled", False)),
+        **{field: scheduling.get(field) for field in fields},
+        "configured": {
+            "timezone": bool(str(config.get("timezone") or "").strip()),
+            "business_hours": "business_hours" in scheduling,
+            **{field: field in scheduling for field in fields},
+        },
+        "readiness": readiness,
+    }
+
+
+async def _audit_admin_configuration(service: Any, org: str, event: str, fields: List[str]) -> None:
+    await service.audit(org, "admin", event, {"changed_fields": sorted(fields)})
+
+
+@router.get("/scheduling/settings")
+async def get_scheduling_settings():
+    config, org, service = _operational_capacity_service()
+    readiness = await service.scheduling_readiness(org, config)
+    return _settings_view(config, readiness)
+
+
+@router.put("/scheduling/settings")
+async def update_scheduling_settings(payload: OrganizationSchedulingPayload):
+    config, org, service = _operational_capacity_service()
+    try:
+        ZoneInfo(payload.timezone)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail="Organization timezone is invalid") from exc
+    business_hours = _normalize_business_hours(payload.business_hours)
+    cutoff = None
+    if payload.same_day_cutoff:
+        cutoff = _validate_clock(payload.same_day_cutoff, "same_day_cutoff")
+    before = _settings_view(config, await service.scheduling_readiness(org, config))
+    proposed = dict(config)
+    scheduling = dict(config.get("scheduling") or {})
+    scheduling.update({"enabled": payload.scheduling_enabled, "business_hours": business_hours})
+    optional_rules = {
+        "minimum_notice_minutes": payload.minimum_notice_minutes,
+        "same_day_cutoff": cutoff,
+        "travel_buffer_before_minutes": payload.travel_buffer_before_minutes,
+        "travel_buffer_after_minutes": payload.travel_buffer_after_minutes,
+        "preparation_buffer_minutes": payload.preparation_buffer_minutes,
+    }
+    for field, value in optional_rules.items():
+        if value is None:
+            scheduling.pop(field, None)
+        else:
+            scheduling[field] = value
+    proposed["timezone"] = payload.timezone
+    proposed["scheduling"] = scheduling
+    readiness = await service.scheduling_readiness(org, proposed)
+    if payload.scheduling_enabled and not readiness["ready"]:
+        raise HTTPException(status_code=409, detail={
+            "message": "Scheduling cannot be enabled until configuration is ready",
+            "missing": readiness["missing"],
+        })
+    apply_result = await _persist_cfg(proposed)
+    after = _settings_view(proposed, readiness)
+    changed = [key for key in after if key not in {"configured", "readiness"} and before.get(key) != after.get(key)]
+    if changed:
+        await _audit_admin_configuration(service, org, "organization_scheduling_updated", changed)
+    return {**after, **_apply_metadata(apply_result)}
+
+
+@router.get("/scheduling/services")
+async def list_scheduling_services():
+    config, _, _ = _operational_capacity_service()
+    services = []
+    for service_id, entry in sorted((config.get("service_catalog") or {}).items()):
+        if not isinstance(entry, dict):
+            continue
+        services.append({
+            "id": service_id,
+            "display_name": str(entry.get("display_name") or entry.get("name") or service_id),
+            "active": bool(entry.get("enabled", True)),
+            "duration_minutes": entry.get("duration_minutes"),
+            "auto_bookable": bool(entry.get("auto_bookable", True)),
+        })
+    return {"services": services}
+
+
+async def _save_scheduling_service(service_id: str, payload: SchedulingServicePayload, *, create: bool) -> Dict[str, Any]:
+    if payload.id != service_id:
+        raise HTTPException(status_code=400, detail="Path and payload service ids must match")
+    config, org, service = _operational_capacity_service()
+    catalog = dict(config.get("service_catalog") or {})
+    exists = service_id in catalog
+    if create and exists:
+        raise HTTPException(status_code=409, detail="Service already exists")
+    if not create and not exists:
+        raise HTTPException(status_code=404, detail="Service not found")
+    if payload.auto_bookable and (not payload.active or payload.duration_minutes is None):
+        raise HTTPException(status_code=422, detail="An auto-bookable service must be active and have a positive duration")
+    current = dict(catalog.get(service_id) or {})
+    current.update({
+        "display_name": payload.display_name,
+        "enabled": payload.active,
+        "duration_minutes": payload.duration_minutes,
+        "auto_bookable": payload.auto_bookable,
+    })
+    catalog[service_id] = current
+    config["service_catalog"] = catalog
+    apply_result = await _persist_cfg(config)
+    await _audit_admin_configuration(service, org, "service_catalog_updated", [service_id])
+    return {"service": payload.model_dump(), **_apply_metadata(apply_result)}
+
+
+@router.post("/scheduling/services", status_code=201)
+async def create_scheduling_service(payload: SchedulingServicePayload):
+    return await _save_scheduling_service(payload.id, payload, create=True)
+
+
+@router.put("/scheduling/services/{service_id}")
+async def update_scheduling_service(service_id: str, payload: SchedulingServicePayload):
+    return await _save_scheduling_service(service_id, payload, create=False)
+
+
 @router.get("/technicians")
 async def list_sarah_technicians():
     _, org, service = _operational_capacity_service()
@@ -1912,7 +2094,9 @@ async def create_sarah_technician(payload: TechnicianPayload):
     if await service.get_technician(org, payload.id):
         raise HTTPException(status_code=409, detail="Technician already exists")
     try:
-        return await service.upsert_technician(org, payload.model_dump(), config.get("service_catalog") or {})
+        values = payload.model_dump()
+        values["organization_timezone"] = str(config.get("timezone") or "")
+        return await service.upsert_technician(org, values, config.get("service_catalog") or {})
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -1923,7 +2107,9 @@ async def update_sarah_technician(technician_id: str, payload: TechnicianPayload
         raise HTTPException(status_code=400, detail="Path and payload technician ids must match")
     config, org, service = _operational_capacity_service()
     try:
-        return await service.upsert_technician(org, payload.model_dump(), config.get("service_catalog") or {})
+        values = payload.model_dump()
+        values["organization_timezone"] = str(config.get("timezone") or "")
+        return await service.upsert_technician(org, values, config.get("service_catalog") or {})
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -2010,7 +2196,7 @@ async def get_sarah_dispatch_calendar(start: str, end: str, technician_ids: str 
     scheduling = config.get("scheduling") or {}
     result.update({
         "organization_id": org,
-        "timezone": str(config.get("timezone") or "America/Vancouver"),
+        "timezone": str(config.get("timezone") or ""),
         "business_hours": scheduling.get("business_hours") or {},
         "scheduling_enabled": bool(scheduling.get("enabled")),
         "services": catalog,

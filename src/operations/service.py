@@ -147,6 +147,7 @@ class OperationalService:
                     CREATE TABLE IF NOT EXISTS technicians(
                       id TEXT NOT NULL, organization_id TEXT NOT NULL, display_name TEXT NOT NULL,
                       active INTEGER NOT NULL DEFAULT 1, timezone TEXT NOT NULL,
+                      timezone_override TEXT,
                       created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
                       PRIMARY KEY(organization_id,id));
                     CREATE TABLE IF NOT EXISTS technician_services(
@@ -213,6 +214,11 @@ class OperationalService:
                       entity_id TEXT, detail_json TEXT NOT NULL, created_at TEXT NOT NULL);
                     """
                 )
+                technician_columns = {
+                    row[1] for row in db.execute("PRAGMA table_info(technicians)").fetchall()
+                }
+                if "timezone_override" not in technician_columns:
+                    db.execute("ALTER TABLE technicians ADD COLUMN timezone_override TEXT")
             try:
                 os.chmod(self.db_path, 0o600)
             except OSError:
@@ -236,7 +242,7 @@ class OperationalService:
     @staticmethod
     def _technician_record(db: sqlite3.Connection, org: str, technician_id: str) -> Optional[Dict[str, Any]]:
         row = db.execute(
-            "SELECT id,organization_id,display_name,active,timezone,created_at,updated_at "
+            "SELECT id,organization_id,display_name,active,timezone,timezone_override,created_at,updated_at "
             "FROM technicians WHERE organization_id=? AND id=?",
             (org, technician_id),
         ).fetchone()
@@ -244,6 +250,7 @@ class OperationalService:
             return None
         result = dict(row)
         result["active"] = bool(result["active"])
+        result["inherit_organization_timezone"] = result.get("timezone_override") is None
         result["service_ids"] = [item[0] for item in db.execute(
             "SELECT service_code FROM technician_services WHERE organization_id=? AND technician_id=? "
             "ORDER BY service_code", (org, technician_id)).fetchall()]
@@ -272,7 +279,13 @@ class OperationalService:
             technician_id = str(data.get("id") or "").strip()
             if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", technician_id):
                 raise ValueError("Technician id must be a stable 1-64 character identifier")
-            tz_name = str(data.get("timezone") or "").strip()
+            inherit_timezone = data.get("inherit_organization_timezone")
+            timezone_override = str(data.get("timezone_override") or data.get("timezone") or "").strip()
+            if inherit_timezone is True:
+                timezone_override = ""
+                tz_name = str(data.get("organization_timezone") or "").strip()
+            else:
+                tz_name = timezone_override
             try:
                 ZoneInfo(tz_name)
             except Exception as exc:
@@ -308,11 +321,13 @@ class OperationalService:
                     (org, technician_id),
                 ).fetchall()]
                 db.execute(
-                    "INSERT INTO technicians(id,organization_id,display_name,active,timezone,created_at,updated_at) "
-                    "VALUES(?,?,?,?,?,?,?) ON CONFLICT(organization_id,id) DO UPDATE SET "
-                    "display_name=excluded.display_name,active=excluded.active,timezone=excluded.timezone,updated_at=excluded.updated_at",
+                    "INSERT INTO technicians(id,organization_id,display_name,active,timezone,timezone_override,created_at,updated_at) "
+                    "VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(organization_id,id) DO UPDATE SET "
+                    "display_name=excluded.display_name,active=excluded.active,timezone=excluded.timezone,"
+                    "timezone_override=excluded.timezone_override,updated_at=excluded.updated_at",
                     (technician_id, org, str(data.get("display_name") or technician_id).strip() or technician_id,
-                     1 if data.get("active", True) else 0, tz_name, existing["created_at"] if existing else now, now),
+                     1 if data.get("active", True) else 0, tz_name, timezone_override or None,
+                     existing["created_at"] if existing else now, now),
                 )
                 db.execute("DELETE FROM technician_services WHERE organization_id=? AND technician_id=?", (org, technician_id))
                 db.executemany(
@@ -347,6 +362,79 @@ class OperationalService:
         def query() -> Optional[Dict[str, Any]]:
             with self._connect() as db:
                 return self._technician_record(db, org, technician_id)
+        return await asyncio.to_thread(query)
+
+    async def scheduling_readiness(self, org: str, config: Dict[str, Any]) -> Dict[str, Any]:
+        """Report whether real persisted capacity is sufficient to enable scheduling."""
+        await self.initialize()
+
+        def query() -> Dict[str, Any]:
+            scheduling = config.get("scheduling") or {}
+            catalog = config.get("service_catalog") or {}
+            missing: list[str] = []
+            timezone_name = str(config.get("timezone") or "").strip()
+            try:
+                ZoneInfo(timezone_name)
+            except Exception:
+                missing.append("organization_timezone")
+            business_hours = scheduling.get("business_hours") or {}
+            valid_business_days = 0
+            try:
+                valid_business_days = sum(
+                    bool(_daily_windows(business_hours.get(day))) for day in WEEKDAY_KEYS
+                )
+            except ValueError:
+                missing.append("valid_business_hours")
+            if not valid_business_days and "valid_business_hours" not in missing:
+                missing.append("business_hours")
+            eligible_services = {
+                str(service_id) for service_id, entry in catalog.items()
+                if isinstance(entry, dict) and entry.get("enabled", True)
+                and entry.get("auto_bookable", True)
+                and self._service_duration(config, str(service_id)) is not None
+            }
+            if not eligible_services:
+                missing.append("auto_bookable_service_duration")
+            with self._connect() as db:
+                active_count = int(db.execute(
+                    "SELECT COUNT(*) FROM technicians WHERE organization_id=? AND active=1", (org,)
+                ).fetchone()[0])
+                assignment_count = int(db.execute(
+                    "SELECT COUNT(*) FROM technician_services s JOIN technicians t "
+                    "ON t.organization_id=s.organization_id AND t.id=s.technician_id "
+                    "WHERE s.organization_id=? AND t.active=1", (org,)
+                ).fetchone()[0])
+                hours_count = int(db.execute(
+                    "SELECT COUNT(*) FROM technician_working_hours h JOIN technicians t "
+                    "ON t.organization_id=h.organization_id AND t.id=h.technician_id "
+                    "WHERE h.organization_id=? AND t.active=1", (org,)
+                ).fetchone()[0])
+                schedulable_count = int(db.execute(
+                    "SELECT COUNT(DISTINCT t.id) FROM technicians t "
+                    "JOIN technician_services s ON s.organization_id=t.organization_id AND s.technician_id=t.id "
+                    "JOIN technician_working_hours h ON h.organization_id=t.organization_id AND h.technician_id=t.id "
+                    "WHERE t.organization_id=? AND t.active=1 AND s.service_code IN (%s)" % (
+                        ",".join("?" for _ in eligible_services) or "NULL"
+                    ), [org, *sorted(eligible_services)]
+                ).fetchone()[0])
+            if not active_count:
+                missing.append("active_technician")
+            if not assignment_count:
+                missing.append("technician_service_assignment")
+            if not hours_count:
+                missing.append("technician_working_hours")
+            if active_count and eligible_services and not schedulable_count:
+                missing.append("eligible_technician_capacity")
+            return {
+                "ready": not missing,
+                "missing": missing,
+                "active_technicians": active_count,
+                "service_assignments": assignment_count,
+                "working_intervals": hours_count,
+                "eligible_services": len(eligible_services),
+                "schedulable_technicians": schedulable_count,
+            }
+
         return await asyncio.to_thread(query)
 
     async def calendar_events(self, org: str, starts_at: str, ends_at: str, *,
@@ -626,7 +714,9 @@ class OperationalService:
         occupied_start = starts - timedelta(minutes=before)
         occupied_end = ends + timedelta(minutes=after)
 
-        org_tz_name = str(config.get("timezone") or "America/Vancouver")
+        org_tz_name = str(config.get("timezone") or "").strip()
+        if not org_tz_name:
+            return "organization_timezone_missing"
         local_org_start = occupied_start.astimezone(ZoneInfo(org_tz_name))
         business_raw = (config.get("scheduling") or {}).get("business_hours") or {}
         business_windows = _daily_windows(business_raw.get(WEEKDAY_KEYS[local_org_start.weekday()]))
@@ -672,7 +762,8 @@ class OperationalService:
     @staticmethod
     def _service_duration(config: Dict[str, Any], service_code: str) -> Optional[int]:
         entry = (config.get("service_catalog") or {}).get(service_code)
-        if not isinstance(entry, dict) or not entry.get("enabled", True):
+        if (not isinstance(entry, dict) or not entry.get("enabled", True)
+                or not entry.get("auto_bookable", True)):
             return None
         try:
             duration = int(entry.get("duration_minutes"))
@@ -700,7 +791,10 @@ class OperationalService:
             if duration is None:
                 return {"status": "configuration_required", "slots": [],
                         "reason": "Service duration is missing or invalid"}
-            tz_name = str(config.get("timezone") or "America/Vancouver")
+            tz_name = str(config.get("timezone") or "").strip()
+            if not tz_name:
+                return {"status": "configuration_required", "slots": [],
+                        "reason": "Organization timezone is not configured"}
             try:
                 tz = ZoneInfo(tz_name)
             except Exception as exc:
@@ -847,7 +941,7 @@ class OperationalService:
                             str(data.get("safety_notes") or ""), str(data.get("access_notes") or ""), brief, call_id, now, now))
                 db.execute("INSERT INTO appointments VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                            (appointment_id, org, job_id, customer_id, slot["technician_id"], slot["starts_at"], slot["ends_at"],
-                            str(config.get("timezone") or "America/Vancouver"), "confirmed", confirmation, now, now))
+                            str(config.get("timezone") or ""), "confirmed", confirmation, now, now))
                 db.execute("UPDATE offered_slots SET consumed_at=? WHERE token=?", (now, slot_token))
                 db.execute("UPDATE leads SET status='booked',customer_id=?,updated_at=? WHERE id=? AND organization_id=?", (customer_id, now, lead_id, org))
                 self._audit(db, org, call_id, "booking_attempted", "appointment", appointment_id)
@@ -970,7 +1064,7 @@ class OperationalService:
                     "UPDATE appointments SET technician_id=?,starts_at=?,ends_at=?,timezone=?,updated_at=? "
                     "WHERE id=? AND organization_id=?",
                     (slot["technician_id"], slot["starts_at"], slot["ends_at"],
-                     str(config.get("timezone") or "America/Vancouver"), now, appointment_id, org),
+                     str(config.get("timezone") or ""), now, appointment_id, org),
                 )
                 db.execute("UPDATE offered_slots SET consumed_at=? WHERE token=?", (now, slot_token))
                 customer = db.execute(
