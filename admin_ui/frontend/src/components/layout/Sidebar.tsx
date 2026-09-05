@@ -147,6 +147,7 @@ const Sidebar = () => {
                         <SidebarItem to="/" icon={LayoutDashboard} label="Dashboard" end />
                         <SidebarItem to="/history" icon={Phone} label="Call History" />
                         <SidebarItem to="/scheduling" icon={CalendarClock} label="Call Scheduling" />
+                        <SidebarItem to="/admin/schedule" icon={CalendarClock} label="Dispatcher Calendar" />
                         <SidebarItem to="/wizard" icon={Zap} label="Setup Wizard" />
                     </SidebarGroup>
 

@@ -302,6 +302,11 @@ class OperationalService:
                     "SELECT created_at FROM technicians WHERE organization_id=? AND id=?",
                     (org, technician_id),
                 ).fetchone()
+                previous_hours = [tuple(row) for row in db.execute(
+                    "SELECT weekday,starts_local,ends_local FROM technician_working_hours "
+                    "WHERE organization_id=? AND technician_id=? ORDER BY weekday,starts_local",
+                    (org, technician_id),
+                ).fetchall()]
                 db.execute(
                     "INSERT INTO technicians(id,organization_id,display_name,active,timezone,created_at,updated_at) "
                     "VALUES(?,?,?,?,?,?,?) ON CONFLICT(organization_id,id) DO UPDATE SET "
@@ -322,6 +327,9 @@ class OperationalService:
                 )
                 self._audit(db, org, "admin", "technician_updated" if existing else "technician_created",
                             "technician", technician_id)
+                if existing and previous_hours != sorted(normalized_hours):
+                    self._audit(db, org, "admin", "technician_hours_updated",
+                                "technician", technician_id)
                 return self._technician_record(db, org, technician_id) or {}
         return await asyncio.to_thread(write)
 
@@ -339,6 +347,133 @@ class OperationalService:
         def query() -> Optional[Dict[str, Any]]:
             with self._connect() as db:
                 return self._technician_record(db, org, technician_id)
+        return await asyncio.to_thread(query)
+
+    async def calendar_events(self, org: str, starts_at: str, ends_at: str, *,
+                              technician_ids: Optional[list[str]] = None,
+                              active_only: bool = True,
+                              service_code: str = "") -> Dict[str, Any]:
+        """Aggregate scheduling records for an admin calendar without materializing capacity."""
+        await self.initialize()
+        starts = _aware_datetime(starts_at, "starts_at")
+        ends = _aware_datetime(ends_at, "ends_at")
+        if starts >= ends:
+            raise ValueError("ends_at must be after starts_at")
+        if ends - starts > timedelta(days=42):
+            raise ValueError("Calendar range cannot exceed 42 days")
+        selected = sorted({str(item).strip() for item in technician_ids or [] if str(item).strip()})
+
+        def query() -> Dict[str, Any]:
+            with self._connect() as db:
+                sql = (
+                    "SELECT id,display_name,active,timezone FROM technicians "
+                    "WHERE organization_id=?"
+                )
+                params: list[Any] = [org]
+                if active_only:
+                    sql += " AND active=1"
+                if selected:
+                    sql += f" AND id IN ({','.join('?' for _ in selected)})"
+                    params.extend(selected)
+                sql += " ORDER BY display_name,id"
+                technicians = [dict(row) for row in db.execute(sql, params).fetchall()]
+                technician_set = {item["id"] for item in technicians}
+                events: list[Dict[str, Any]] = []
+
+                for technician in technicians:
+                    tz = ZoneInfo(technician["timezone"])
+                    local_day = starts.astimezone(tz).date()
+                    final_day = (ends - timedelta(microseconds=1)).astimezone(tz).date()
+                    rows = db.execute(
+                        "SELECT weekday,starts_local,ends_local FROM technician_working_hours "
+                        "WHERE organization_id=? AND technician_id=? ORDER BY weekday,starts_local",
+                        (org, technician["id"]),
+                    ).fetchall()
+                    by_weekday: Dict[int, list[sqlite3.Row]] = {}
+                    for row in rows:
+                        by_weekday.setdefault(int(row["weekday"]), []).append(row)
+                    while local_day <= final_day:
+                        for row in by_weekday.get(local_day.weekday(), []):
+                            event_start = datetime.combine(local_day, _clock(row["starts_local"]), tzinfo=tz)
+                            event_end = datetime.combine(local_day, _clock(row["ends_local"]), tzinfo=tz)
+                            if _overlaps(event_start, event_end, starts, ends):
+                                events.append({
+                                    "id": f"hours:{technician['id']}:{local_day.isoformat()}:{row['starts_local']}",
+                                    "type": "working_hours", "technician_id": technician["id"],
+                                    "start": event_start.isoformat(), "end": event_end.isoformat(),
+                                    "status": "active", "title": "Recurring working hours",
+                                })
+                        local_day += timedelta(days=1)
+
+                def append_exceptions(table: str, event_type: str, title: str) -> None:
+                    event_sql = (
+                        f"SELECT id,technician_id,starts_at,ends_at,reason,status FROM {table} "
+                        "WHERE organization_id=? AND status='active' AND starts_at<? AND ends_at>?"
+                    )
+                    event_params: list[Any] = [org, ends.isoformat(), starts.isoformat()]
+                    if technician_set:
+                        event_sql += f" AND technician_id IN ({','.join('?' for _ in technician_set)})"
+                        event_params.extend(sorted(technician_set))
+                    elif selected or active_only:
+                        return
+                    for row in db.execute(event_sql, event_params).fetchall():
+                        events.append({
+                            "id": row["id"], "type": event_type,
+                            "technician_id": row["technician_id"],
+                            "start": row["starts_at"], "end": row["ends_at"],
+                            "status": row["status"], "title": row["reason"] or title,
+                            "reason": row["reason"] or "",
+                        })
+
+                append_exceptions("technician_time_off", "time_off", "Time off")
+                append_exceptions("technician_schedule_blocks", "schedule_block", "Schedule block")
+
+                appointment_sql = (
+                    "SELECT a.id,a.job_id,a.customer_id,a.technician_id,a.starts_at,a.ends_at,a.timezone,"
+                    "a.status,a.confirmation_ref,j.service_code,c.first_name,c.last_name "
+                    "FROM appointments a "
+                    "JOIN jobs j ON j.id=a.job_id AND j.organization_id=a.organization_id "
+                    "LEFT JOIN customers c ON c.id=a.customer_id AND c.organization_id=a.organization_id "
+                    "WHERE a.organization_id=? AND a.status IN ('confirmed','booked') "
+                    "AND a.starts_at<? AND a.ends_at>?"
+                )
+                appointment_params: list[Any] = [org, ends.isoformat(), starts.isoformat()]
+                if technician_set:
+                    appointment_sql += f" AND a.technician_id IN ({','.join('?' for _ in technician_set)})"
+                    appointment_params.extend(sorted(technician_set))
+                elif selected or active_only:
+                    appointment_sql += " AND 1=0"
+                if service_code:
+                    appointment_sql += " AND j.service_code=?"
+                    appointment_params.append(service_code)
+                for row in db.execute(appointment_sql, appointment_params).fetchall():
+                    customer_name = " ".join(filter(None, [row["first_name"], row["last_name"]])).strip()
+                    events.append({
+                        "id": row["id"], "type": "appointment",
+                        "technician_id": row["technician_id"],
+                        "start": row["starts_at"], "end": row["ends_at"],
+                        "status": row["status"], "title": row["service_code"],
+                        "service_code": row["service_code"],
+                        "customer_name": customer_name,
+                        "confirmation_ref": row["confirmation_ref"],
+                    })
+                events.sort(key=lambda item: (item["start"], item["technician_id"], item["type"]))
+                return {"technicians": technicians, "events": events}
+
+        return await asyncio.to_thread(query)
+
+    async def get_appointment(self, org: str, appointment_id: str) -> Optional[Dict[str, Any]]:
+        await self.initialize()
+        def query() -> Optional[Dict[str, Any]]:
+            with self._connect() as db:
+                row = db.execute(
+                    "SELECT a.id,a.job_id,a.customer_id,a.technician_id,a.starts_at,a.ends_at,a.timezone,"
+                    "a.status,a.confirmation_ref,j.service_code FROM appointments a "
+                    "JOIN jobs j ON j.id=a.job_id AND j.organization_id=a.organization_id "
+                    "WHERE a.organization_id=? AND a.id=?",
+                    (org, appointment_id),
+                ).fetchone()
+                return dict(row) if row else None
         return await asyncio.to_thread(query)
 
     async def set_technician_exception(self, org: str, technician_id: str, kind: str,
@@ -365,7 +500,8 @@ class OperationalService:
                     (entry_id, org, technician_id, starts.isoformat(), ends.isoformat(),
                      str(data.get("reason") or "").strip(), "active", now, now),
                 )
-                self._audit(db, org, "admin", f"technician_{kind}_created", kind, entry_id,
+                event = "technician_time_off_created" if kind == "time_off" else "schedule_block_created"
+                self._audit(db, org, "admin", event, kind, entry_id,
                             {"technician_id": technician_id})
             return {"id": entry_id, "technician_id": technician_id, "start_datetime": starts.isoformat(),
                     "end_datetime": ends.isoformat(), "reason": str(data.get("reason") or "").strip(),
@@ -387,7 +523,8 @@ class OperationalService:
                 )
                 if cursor.rowcount != 1:
                     raise ValueError("Active schedule exception not found for this organization")
-                self._audit(db, org, "admin", f"technician_{kind}_cancelled", kind, entry_id,
+                event = "technician_time_off_cancelled" if kind == "time_off" else "schedule_block_cancelled"
+                self._audit(db, org, "admin", event, kind, entry_id,
                             {"technician_id": technician_id})
             return {"id": entry_id, "status": "cancelled"}
         return await asyncio.to_thread(write)
@@ -786,11 +923,12 @@ class OperationalService:
             with self._connect() as db:
                 db.execute("BEGIN IMMEDIATE")
                 appointment = db.execute(
-                    "SELECT * FROM appointments WHERE id=? AND organization_id=? AND status='confirmed'",
+                    "SELECT * FROM appointments WHERE id=? AND organization_id=? "
+                    "AND status IN ('confirmed','booked')",
                     (appointment_id, org),
                 ).fetchone()
                 if not appointment:
-                    raise ValueError("Confirmed appointment not found for this organization")
+                    raise ValueError("Active appointment not found for this organization")
                 if action == "cancel":
                     db.execute("UPDATE appointments SET status='cancelled',updated_at=? WHERE id=? AND organization_id=?",
                                (now, appointment_id, org))

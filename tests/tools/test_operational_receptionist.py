@@ -480,3 +480,75 @@ async def test_reschedule_revalidates_service_eligibility_and_releases_old_slot(
     available_again = await OperationalService(str(db_path)).offer_slots(
         "coreline", "call-old-slot", "furnace_repair", start_date, 1, capacity_settings(db_path))
     assert old_start in {slot["starts_at"] for slot in available_again["slots"]}
+
+
+@pytest.mark.asyncio
+async def test_calendar_aggregates_native_records_with_tenant_and_range_filters(tmp_path):
+    db_path = tmp_path / "calendar.db"
+    ctx, _, customer_id, lead_id = await create_booking_prerequisites(db_path, "call-calendar")
+    service = OperationalService(str(db_path))
+    config = operational_config(db_path)["tools"]["operational_receptionist"]
+    day = (datetime.now(ZoneInfo("America/Vancouver")) + timedelta(days=1)).date()
+    offered = await service.offer_slots("coreline", "call-calendar", "furnace_repair", day.isoformat(), 1, config)
+    booked = await service.book(
+        "coreline", "call-calendar", offered["slots"][0]["slot_token"], customer_id, lead_id,
+        {"issue_description": "No heat", "urgency": "high"}, config)
+    start = datetime.combine(day, datetime.min.time(), tzinfo=ZoneInfo("America/Vancouver"))
+    await service.set_technician_exception("coreline", "tech-hvac", "time_off", {
+        "start_datetime": (start + timedelta(hours=13)).isoformat(),
+        "end_datetime": (start + timedelta(hours=14)).isoformat(), "reason": "training"})
+    await service.set_technician_exception("coreline", "tech-hvac", "block", {
+        "start_datetime": (start + timedelta(hours=15)).isoformat(),
+        "end_datetime": (start + timedelta(hours=16)).isoformat(), "reason": "warehouse"})
+    await service.upsert_technician("other-org", {
+        "id": "other-tech", "display_name": "Other", "active": True,
+        "timezone": "America/Vancouver", "service_ids": ["furnace_repair"],
+        "working_hours": {day.strftime("%a").lower(): [["09:00", "17:00"]]},
+    }, config["service_catalog"])
+
+    result = await service.calendar_events(
+        "coreline", start.isoformat(), (start + timedelta(days=1)).isoformat())
+    types = {event["type"] for event in result["events"]}
+    assert {"working_hours", "appointment", "time_off", "schedule_block"} <= types
+    assert {event["technician_id"] for event in result["events"]} == {"tech-hvac"}
+    appointment = next(event for event in result["events"] if event["type"] == "appointment")
+    assert appointment["id"] == booked["appointment_id"]
+    assert appointment["customer_name"] == "Sam"
+    assert "phone" not in appointment and "address" not in appointment
+
+    filtered = await service.calendar_events(
+        "coreline", start.isoformat(), (start + timedelta(days=1)).isoformat(),
+        technician_ids=["does-not-exist"])
+    assert filtered["technicians"] == [] and filtered["events"] == []
+
+
+@pytest.mark.asyncio
+async def test_calendar_exception_mutations_change_next_availability_without_generation(tmp_path):
+    db_path = tmp_path / "calendar-realtime.db"
+    service = await configure_capacity(db_path)
+    config = capacity_settings(db_path)
+    day = "2026-09-07"
+    now = datetime(2026, 9, 6, 8, 0, tzinfo=ZoneInfo("America/Vancouver"))
+    baseline = await service.offer_slots(
+        "coreline", "preview-before", "furnace_repair", day, 1, config,
+        persist_offers=False, now=now)
+    first_start = baseline["slots"][0]["starts_at"]
+    block = await service.set_technician_exception("coreline", "tech-1", "block", {
+        "start_datetime": first_start,
+        "end_datetime": baseline["slots"][0]["ends_at"], "reason": "meeting"})
+    blocked = await service.offer_slots(
+        "coreline", "preview-blocked", "furnace_repair", day, 1, config,
+        persist_offers=False, now=now)
+    assert first_start not in {slot["starts_at"] for slot in blocked["slots"]}
+    await service.cancel_technician_exception("coreline", "tech-1", "block", block["id"])
+    restored = await service.offer_slots(
+        "coreline", "preview-restored", "furnace_repair", day, 1, config,
+        persist_offers=False, now=now)
+    assert first_start in {slot["starts_at"] for slot in restored["slots"]}
+
+    tech = await service.get_technician("coreline", "tech-1")
+    await service.upsert_technician("coreline", {**tech, "active": False}, config["service_catalog"])
+    inactive = await service.offer_slots(
+        "coreline", "preview-inactive", "furnace_repair", day, 1, config,
+        persist_offers=False, now=now)
+    assert inactive["status"] == "configuration_required"

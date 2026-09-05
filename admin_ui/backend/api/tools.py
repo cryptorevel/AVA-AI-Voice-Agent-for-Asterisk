@@ -1869,6 +1869,10 @@ class TechnicianExceptionPayload(BaseModel):
     reason: str = Field(default="", max_length=300)
 
 
+class AppointmentReschedulePayload(BaseModel):
+    slot_token: str = Field(min_length=1, max_length=256)
+
+
 def _operational_capacity_service():
     import sys
 
@@ -1980,3 +1984,101 @@ async def preview_sarah_technician_availability(technician_id: str, service_code
         raise HTTPException(status_code=422, detail="days must be between 1 and 21")
     return await service.offer_slots(org, "admin-preview", service_code, start_date, days, config,
                                      persist_offers=False, technician_id=technician_id)
+
+
+@router.get("/calendar")
+async def get_sarah_dispatch_calendar(start: str, end: str, technician_ids: str = "",
+                                      active_only: bool = True, service_code: str = ""):
+    config, org, service = _operational_capacity_service()
+    selected = [item.strip() for item in technician_ids.split(",") if item.strip()]
+    try:
+        result = await service.calendar_events(
+            org, start, end, technician_ids=selected, active_only=active_only,
+            service_code=service_code.strip())
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    catalog = []
+    for service_id, entry in sorted((config.get("service_catalog") or {}).items()):
+        if not isinstance(entry, dict):
+            continue
+        catalog.append({
+            "id": service_id,
+            "display_name": str(entry.get("display_name") or service_id.replace("_", " ").title()),
+            "active": bool(entry.get("enabled", True)),
+            "duration_minutes": entry.get("duration_minutes"),
+        })
+    scheduling = config.get("scheduling") or {}
+    result.update({
+        "organization_id": org,
+        "timezone": str(config.get("timezone") or "America/Vancouver"),
+        "business_hours": scheduling.get("business_hours") or {},
+        "scheduling_enabled": bool(scheduling.get("enabled")),
+        "services": catalog,
+    })
+    return result
+
+
+@router.get("/calendar/availability-preview")
+async def preview_sarah_calendar_availability(service_code: str, start_date: str, days: int = 1,
+                                               technician_id: str = ""):
+    config, org, service = _operational_capacity_service()
+    if technician_id and not await service.get_technician(org, technician_id):
+        raise HTTPException(status_code=404, detail="Technician not found")
+    if days < 1 or days > 21:
+        raise HTTPException(status_code=422, detail="days must be between 1 and 21")
+    try:
+        return await service.offer_slots(
+            org, "admin-calendar-preview", service_code, start_date, days, config,
+            persist_offers=False, technician_id=technician_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.post("/calendar/appointments/{appointment_id}/cancel")
+async def cancel_sarah_calendar_appointment(appointment_id: str):
+    _, org, service = _operational_capacity_service()
+    try:
+        return await service.change_appointment(org, "admin-calendar", appointment_id, "cancel")
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/calendar/appointments/{appointment_id}/reschedule-options")
+async def get_sarah_calendar_reschedule_options(appointment_id: str, start_date: str,
+                                                days: int = 7, technician_id: str = ""):
+    config, org, service = _operational_capacity_service()
+    appointment = await service.get_appointment(org, appointment_id)
+    if not appointment or appointment.get("status") not in {"confirmed", "booked"}:
+        raise HTTPException(status_code=404, detail="Active appointment not found")
+    if days < 1 or days > 21:
+        raise HTTPException(status_code=422, detail="days must be between 1 and 21")
+    call_id = f"admin-reschedule:{appointment_id}"
+    try:
+        return await service.offer_slots(
+            org, call_id, appointment["service_code"], start_date, days, config,
+            persist_offers=True, technician_id=technician_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.post("/calendar/appointments/{appointment_id}/reschedule")
+async def reschedule_sarah_calendar_appointment(appointment_id: str,
+                                                payload: AppointmentReschedulePayload):
+    config, org, service = _operational_capacity_service()
+    call_id = f"admin-reschedule:{appointment_id}"
+    try:
+        result = await service.change_appointment(
+            org, call_id, appointment_id, "reschedule", payload.slot_token, config)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    company = str(config.get("company_name") or "the service team")
+    sms = await service.send_sms(
+        org, appointment_id, result.get("customer_phone", ""),
+        f"{company}: your appointment is rescheduled for {result['starts_at']}.", config)
+    if not sms.get("sent"):
+        await service.create_escalation(
+            org, call_id, "", "sms_failure",
+            "Appointment rescheduled but confirmation SMS was not sent", "normal")
+    return {**result, "sms": sms}

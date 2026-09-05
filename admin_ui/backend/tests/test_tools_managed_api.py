@@ -1,3 +1,4 @@
+import asyncio
 import copy
 import threading
 
@@ -791,3 +792,132 @@ def test_sarah_technician_admin_crud_exceptions_and_preview(monkeypatch, tmp_pat
     updated = client.put("/api/tools/technicians/tech-1", json=payload)
     assert updated.status_code == 200
     assert updated.json()["active"] is False
+
+
+def test_sarah_dispatch_calendar_aggregates_filters_and_uses_live_preview(monkeypatch, tmp_path):
+    from src.operations.service import OperationalService
+
+    service = OperationalService(str(tmp_path / "operations.db"))
+    config = {
+        "timezone": "America/Vancouver",
+        "service_catalog": {"repair": {
+            "enabled": True, "display_name": "Repair", "duration_minutes": 120}},
+        "scheduling": {
+            "enabled": True, "minimum_notice_minutes": 0,
+            "slot_interval_minutes": 120, "max_offered_slots": 3,
+            "business_hours": {"mon": ["07:00", "19:00"]},
+        },
+    }
+    monkeypatch.setattr(tools_api, "_operational_capacity_service",
+                        lambda: (config, "org-admin", service))
+    app = FastAPI()
+    app.include_router(tools_api.router, prefix="/api/tools")
+    client = TestClient(app)
+    payload = {
+        "id": "tech-1", "display_name": "Dispatcher Tech", "active": True,
+        "timezone": "America/Vancouver", "service_ids": ["repair"],
+        "working_hours": {"mon": [["08:00", "17:00"]]},
+    }
+    assert client.post("/api/tools/technicians", json=payload).status_code == 201
+    block = client.post("/api/tools/technicians/tech-1/blocks", json={
+        "start_datetime": "2026-09-07T08:00:00-07:00",
+        "end_datetime": "2026-09-07T10:00:00-07:00", "reason": "meeting"})
+    assert block.status_code == 201
+
+    calendar = client.get("/api/tools/calendar", params={
+        "start": "2026-09-07T00:00:00-07:00",
+        "end": "2026-09-08T00:00:00-07:00",
+        "technician_ids": "tech-1", "active_only": True,
+    })
+    assert calendar.status_code == 200, calendar.text
+    body = calendar.json()
+    assert body["timezone"] == "America/Vancouver"
+    assert body["business_hours"] == {"mon": ["07:00", "19:00"]}
+    assert body["services"][0]["display_name"] == "Repair"
+    assert {event["type"] for event in body["events"]} == {"working_hours", "schedule_block"}
+
+    preview = client.get("/api/tools/calendar/availability-preview", params={
+        "service_code": "repair", "start_date": "2026-09-07", "days": 1,
+        "technician_id": "tech-1",
+    })
+    assert preview.status_code == 200
+    assert all(slot["start"][11:16] != "09:00" for slot in preview.json()["slots"])
+    assert client.delete(
+        f"/api/tools/technicians/tech-1/blocks/{block.json()['id']}").status_code == 200
+    restored = client.get("/api/tools/calendar/availability-preview", params={
+        "service_code": "repair", "start_date": "2026-09-07", "days": 1,
+        "technician_id": "tech-1",
+    })
+    assert restored.json()["slots"][0]["start"][11:16] == "09:00"
+
+
+def test_sarah_dispatch_calendar_rejects_invalid_range(monkeypatch, tmp_path):
+    from src.operations.service import OperationalService
+
+    service = OperationalService(str(tmp_path / "operations.db"))
+    monkeypatch.setattr(tools_api, "_operational_capacity_service",
+                        lambda: ({}, "org-admin", service))
+    app = FastAPI()
+    app.include_router(tools_api.router, prefix="/api/tools")
+    client = TestClient(app)
+    response = client.get("/api/tools/calendar", params={
+        "start": "2026-09-08T00:00:00-07:00",
+        "end": "2026-09-07T00:00:00-07:00",
+    })
+    assert response.status_code == 422
+
+
+def test_sarah_dispatch_calendar_reschedules_and_cancels_with_revalidation(monkeypatch, tmp_path):
+    from src.operations.service import OperationalService
+
+    service = OperationalService(str(tmp_path / "operations.db"))
+    config = {
+        "timezone": "America/Vancouver", "company_name": "Test Service",
+        "service_catalog": {"repair": {"enabled": True, "duration_minutes": 120}},
+        "scheduling": {
+            "enabled": True, "minimum_notice_minutes": 0,
+            "slot_interval_minutes": 120, "max_offered_slots": 3,
+            "business_hours": {"mon": ["07:00", "19:00"]},
+        },
+        "sms": {"enabled": False, "provider": "twilio"},
+    }
+
+    async def seed():
+        await service.upsert_technician("org-admin", {
+            "id": "tech-1", "display_name": "Tech", "active": True,
+            "timezone": "America/Vancouver", "service_ids": ["repair"],
+            "working_hours": {"mon": [["07:00", "19:00"]]},
+        }, config["service_catalog"])
+        customer = await service.upsert_customer("org-admin", "seed-call", {
+            "first_name": "Customer", "phone": "+16045550199", "address": "1 Test St",
+            "city": "Vancouver", "postal_code": "V5K0A1"})
+        lead = await service.upsert_lead("org-admin", "seed-call", {
+            "customer_id": customer["customer_id"], "caller_number": "+16045550199",
+            "service_category": "repair", "service_hint": "repair",
+            "issue_description": "Test", "urgency": "standard"})
+        slots = await service.offer_slots("org-admin", "seed-call", "repair", "2026-09-07", 1, config)
+        return await service.book(
+            "org-admin", "seed-call", slots["slots"][0]["slot_token"],
+            customer["customer_id"], lead["lead_id"], {}, config)
+
+    booked = asyncio.run(seed())
+    monkeypatch.setattr(tools_api, "_operational_capacity_service",
+                        lambda: (config, "org-admin", service))
+    app = FastAPI()
+    app.include_router(tools_api.router, prefix="/api/tools")
+    client = TestClient(app)
+    options = client.get(
+        f"/api/tools/calendar/appointments/{booked['appointment_id']}/reschedule-options",
+        params={"start_date": "2026-09-07", "days": 1})
+    assert options.status_code == 200 and options.json()["slots"]
+    replacement = options.json()["slots"][0]
+    moved = client.post(
+        f"/api/tools/calendar/appointments/{booked['appointment_id']}/reschedule",
+        json={"slot_token": replacement["slot_token"]})
+    assert moved.status_code == 200, moved.text
+    assert moved.json()["starts_at"] == replacement["starts_at"]
+    assert moved.json()["sms"]["sent"] is False
+    cancelled = client.post(
+        f"/api/tools/calendar/appointments/{booked['appointment_id']}/cancel")
+    assert cancelled.status_code == 200
+    assert cancelled.json()["status"] == "cancelled"
